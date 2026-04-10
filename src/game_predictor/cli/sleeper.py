@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+"""
+SLEEPER AGENT -- Gemma 4-powered watchdog for autonomous overnight runs.
+TOP-LEVEL ENTRY POINT. Run this, then go to sleep.
+
+Usage:
+    python sleeper.py [--llm-base-url http://localhost:11434/v1]
+                      [--max-restarts 5] [--hang-timeout 600]
+"""
+
+import argparse
+import json
+import logging
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import duckdb
+import httpx
+
+HEARTBEAT_FILE = Path("heartbeat.json")
+PROD_LOG_FILE = Path("production_run.log")
+DB_PATH = "gameplay_data.duckdb"
+OLLAMA_HEALTH_URL = "http://localhost:11434/v1/models"
+DEFAULT_HANG_TIMEOUT = 600
+DEFAULT_MAX_RESTARTS = 5
+ALLOWED_ACTIONS = {
+    "restart_production",
+    "restart_ollama",
+    "restart_browser",
+    "switch_to_bing",
+    "increase_delays",
+    "skip_current_game",
+    "clear_heartbeat_and_retry",
+    "abort",
+}
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [SLEEPER] %(message)s",
+    handlers=[
+        logging.FileHandler("sleeper.log", mode="a"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+logger = logging.getLogger("sleeper")
+
+
+def read_heartbeat() -> dict | None:
+    try:
+        return json.loads(HEARTBEAT_FILE.read_text()) if HEARTBEAT_FILE.exists() else None
+    except Exception:
+        return None
+
+
+def read_log_tail(n=80) -> str:
+    try:
+        return "\n".join(PROD_LOG_FILE.read_text().splitlines()[-n:]) if PROD_LOG_FILE.exists() else ""
+    except Exception:
+        return ""
+
+
+def read_db_state() -> dict:
+    try:
+        c = duckdb.connect(DB_PATH, read_only=True)
+        t = c.execute("SELECT COUNT(*) FROM gameplay_records").fetchone()[0]
+        pg = dict(
+            c.execute(
+                "SELECT video_game_name, COUNT(*) FROM gameplay_records GROUP BY 1"
+            ).fetchall()
+        )
+        c.close()
+        return {"total": t, "per_game": pg}
+    except Exception as e:
+        return {"total": -1, "per_game": {}, "error": str(e)}
+
+
+def check_ollama_health() -> bool:
+    try:
+        return httpx.get(OLLAMA_HEALTH_URL, timeout=10).status_code == 200
+    except Exception:
+        return False
+
+
+def diagnose_with_gemma4(
+    exit_code, heartbeat, log_tail, db_state, ollama_ok, restart_count, url
+) -> dict:
+    prompt = f"""You are a systems diagnostician for a Python web-scraping pipeline.
+The pipeline crashed or hung. Analyze these signals and recommend exactly ONE action.
+
+SIGNALS:
+- Exit code: {exit_code}
+- Ollama healthy: {ollama_ok}
+- Restart count: {restart_count}/5
+- Heartbeat: {json.dumps(heartbeat, indent=2) if heartbeat else "MISSING"}
+- DB state: {json.dumps(db_state, indent=2)}
+- Last 80 log lines:
+```
+{log_tail[-4000:]}
+```
+
+ALLOWED ACTIONS:
+- restart_production: Simple restart --resume. Transient crash.
+- restart_ollama: Restart Ollama daemon. LLM failures / Ollama unhealthy.
+- restart_browser: Clear Playwright state. Browser/page crash errors.
+- switch_to_bing: Switch to Bing Images. Google CAPTCHA / rate-limit blocks.
+- increase_delays: Double rate-limit delays. Rate-limiting errors.
+- skip_current_game: Skip failing game. One game's sources consistently broken.
+- clear_heartbeat_and_retry: Clear stale heartbeat. Stale heartbeat but recent log.
+- abort: Stop entirely. Fundamental issue (disk full, no internet, 5th identical crash).
+
+Return JSON only: {{"diagnosis": "...", "action": "action_name", "reasoning": "..."}}"""
+
+    try:
+        r = httpx.post(
+            f"{url}/chat/completions",
+            json={
+                "model": "gemma4:26b",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 4096,
+                "temperature": 0.2,
+            },
+            timeout=60,
+        )
+        text = r.json()["choices"][0]["message"]["content"]
+        text = text.replace("```json", "").replace("```", "").strip()
+        result = json.loads(text)
+        if result.get("action") not in ALLOWED_ACTIONS:
+            result["action"] = "restart_production"
+        return result
+    except Exception as e:
+        logger.error(f"Diagnosis failed: {e}")
+        if not ollama_ok:
+            return {
+                "diagnosis": "Ollama unreachable",
+                "action": "restart_ollama",
+                "reasoning": "LLM down",
+            }
+        return {
+            "diagnosis": str(e),
+            "action": "restart_production",
+            "reasoning": "Fallback restart",
+        }
+
+
+def execute_action(action: str, llm_url: str) -> bool:
+    logger.info(f"Executing: {action}")
+
+    if action == "restart_production":
+        return True
+
+    if action == "restart_ollama":
+        try:
+            subprocess.run(["pkill", "-f", "ollama"], timeout=10)
+            time.sleep(3)
+            subprocess.Popen(
+                ["ollama", "serve"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            time.sleep(5)
+            subprocess.run(
+                ["ollama", "run", "gemma4:26b", "--keepalive", "9h"],
+                input="hello",
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            for _ in range(12):
+                time.sleep(5)
+                if check_ollama_health():
+                    return True
+            return False
+        except Exception as e:
+            logger.error(f"Ollama restart failed: {e}")
+            return False
+
+    if action == "restart_browser":
+        import shutil
+
+        for d in Path("/tmp").glob("playwright-*"):
+            shutil.rmtree(d, ignore_errors=True)
+        return True
+
+    if action == "switch_to_bing":
+        os.environ["SCRAPER_SEARCH_FALLBACK"] = "bing"
+        return True
+
+    if action == "increase_delays":
+        cur = int(os.environ.get("SCRAPER_DELAY_MULTIPLIER", "1"))
+        os.environ["SCRAPER_DELAY_MULTIPLIER"] = str(cur * 2)
+        return True
+
+    if action == "skip_current_game":
+        hb = read_heartbeat()
+        if hb and hb.get("per_game"):
+            game = min(hb["per_game"], key=hb["per_game"].get)
+            Path(f".skip_{game.replace(' ', '_').lower()}").write_text(
+                f"Skipped by sleeper at {datetime.now().isoformat()}"
+            )
+        return True
+
+    if action == "clear_heartbeat_and_retry":
+        HEARTBEAT_FILE.unlink(missing_ok=True)
+        return True
+
+    if action == "abort":
+        logger.error("ABORT -- human intervention required.")
+        return False
+
+    return True
+
+
+def spawn(url):
+    cmd = [sys.executable, "-m", "game_predictor.cli.run_production",
+           "--llm-base-url", url, "--resume"]
+    logger.info(f"Spawning: {' '.join(cmd)}")
+    child_env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2])}
+    child_env.pop("PLAYWRIGHT_BROWSERS_PATH", None)
+    p = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        env=child_env,
+    )
+    logger.info(f"Child PID: {p.pid}")
+    return p
+
+
+def kill_child(p):
+    if p.poll() is not None:
+        return
+    p.terminate()
+    try:
+        p.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.wait(10)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--llm-base-url", default="http://localhost:11434/v1")
+    ap.add_argument("--max-restarts", type=int, default=DEFAULT_MAX_RESTARTS)
+    ap.add_argument("--hang-timeout", type=int, default=DEFAULT_HANG_TIMEOUT)
+    args = ap.parse_args()
+
+    t0 = datetime.now()
+    deadline = t0 + timedelta(hours=9)
+    restarts = 0
+
+    logger.info("=" * 70)
+    logger.info(
+        f"SLEEPER ACTIVE | deadline {deadline.isoformat()} | max restarts {args.max_restarts}"
+    )
+    logger.info("=" * 70)
+
+    while restarts <= args.max_restarts:
+        if datetime.now() >= deadline:
+            break
+
+        proc = spawn(args.llm_base_url)
+        last_progress = datetime.now()
+        last_count = -1
+        exit_code = None
+
+        while True:
+            time.sleep(15)
+            if datetime.now() >= deadline:
+                kill_child(proc)
+                break
+
+            exit_code = proc.poll()
+            if exit_code is not None:
+                if exit_code == 0:
+                    db = read_db_state()
+                    if db["total"] >= 1000:
+                        logger.info(f"TARGET MET ({db['total']})")
+                        return
+                    logger.warning(f"Clean exit, {db['total']}/1000. Restarting.")
+                else:
+                    logger.error(f"Crash (exit {exit_code})")
+                break
+
+            hb = read_heartbeat()
+            if hb:
+                cur = hb.get("total_records", -1)
+                if cur > last_count:
+                    last_count = cur
+                    last_progress = datetime.now()
+                elif (datetime.now() - last_progress).total_seconds() > args.hang_timeout:
+                    logger.error(f"HANG at {cur} records")
+                    kill_child(proc)
+                    exit_code = -1
+                    break
+                if int(time.time()) % 120 < 15:
+                    logger.info(f"OK | {cur}/1000")
+            elif (datetime.now() - last_progress).total_seconds() > args.hang_timeout:
+                logger.error("No heartbeat")
+                kill_child(proc)
+                exit_code = -2
+                break
+
+        if datetime.now() >= deadline:
+            break
+
+        restarts += 1
+        logger.info(f"\n  RESTART {restarts}/{args.max_restarts}")
+        hb = read_heartbeat()
+        log = read_log_tail()
+        db = read_db_state()
+        ollama_ok = check_ollama_health()
+        logger.info(f"Ollama={ollama_ok} DB={db.get('total', '?')}")
+        dx = diagnose_with_gemma4(
+            exit_code, hb, log, db, ollama_ok, restarts, args.llm_base_url
+        )
+        logger.info(f"Dx: {dx.get('diagnosis')} -> {dx.get('action')}")
+        if not execute_action(
+            dx.get("action", "restart_production"), args.llm_base_url
+        ):
+            if dx.get("action") == "abort":
+                break
+        time.sleep(30)
+
+    db_final = read_db_state()
+    logger.info("=" * 70)
+    logger.info(
+        f"SESSION DONE | restarts={restarts} | records={db_final.get('total', 0)}/1000 | "
+        f"elapsed={datetime.now() - t0}"
+    )
+    status = "MET" if db_final.get("total", 0) >= 1000 else "NOT MET"
+    logger.info(status)
+    logger.info("=" * 70)
+
+
+if __name__ == "__main__":
+    main()

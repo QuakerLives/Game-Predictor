@@ -152,8 +152,8 @@ GAMES = [
 # ---------------------------------------------------------------------------
 
 BROWSER_CONCURRENCY = 5
-LLM_CONCURRENCY = 3
-DOWNLOAD_CONCURRENCY = 8
+LLM_CONCURRENCY = 5
+DOWNLOAD_CONCURRENCY = 10
 
 # ---------------------------------------------------------------------------
 # Rate Limiting
@@ -161,6 +161,27 @@ DOWNLOAD_CONCURRENCY = 8
 
 MIN_DELAY_SECONDS = 2.0
 MAX_DELAY_SECONDS = 5.0
+
+# ---------------------------------------------------------------------------
+# Enrichment Pass (see addendum)
+# ---------------------------------------------------------------------------
+
+ENRICHMENT_BATCH_SIZE = 5
+ENRICHMENT_RECORD_TIMEOUT = 120        # seconds per record
+ENRICHMENT_BROWSER_TIMEOUT = 60        # seconds for article/channel extraction
+ENRICHMENT_LLM_TIMEOUT = 30            # seconds for experience assessment
+
+# Fields that can be enriched (allowlist for UPDATE queries)
+ENRICHABLE_FIELDS = frozenset({
+    "player_name",
+    "gameplay_timestamp",
+    "experience_level",
+    "gameplay_level",
+    "total_playtime",
+    "channel_description",
+    "player_experience_narration",
+    "identifying_quotes",
+})
 
 # ---------------------------------------------------------------------------
 # Ollama / LLM

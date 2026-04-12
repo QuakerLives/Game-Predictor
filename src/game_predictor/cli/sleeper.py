@@ -25,8 +25,8 @@ HEARTBEAT_FILE = Path("heartbeat.json")
 PROD_LOG_FILE = Path("production_run.log")
 DB_PATH = "gameplay_data.duckdb"
 OLLAMA_HEALTH_URL = "http://localhost:11434/v1/models"
-DEFAULT_HANG_TIMEOUT = 600
-DEFAULT_MAX_RESTARTS = 5
+DEFAULT_HANG_TIMEOUT = 900
+DEFAULT_MAX_RESTARTS = 8
 ALLOWED_ACTIONS = {
     "restart_production",
     "restart_ollama",
@@ -123,7 +123,7 @@ Return JSON only: {{"diagnosis": "...", "action": "action_name", "reasoning": ".
                 "max_tokens": 4096,
                 "temperature": 0.2,
             },
-            timeout=60,
+            timeout=180,
         )
         text = r.json()["choices"][0]["message"]["content"]
         text = text.replace("```json", "").replace("```", "").strip()
@@ -228,6 +228,81 @@ def spawn(url):
     return p
 
 
+def spawn_enrichment(url, max_duration="2h"):
+    """Spawn run_production.py in --enrich-only mode."""
+    cmd = [sys.executable, "-m", "game_predictor.cli.run_production",
+           "--llm-base-url", url, "--enrich-only", "--max-duration", max_duration]
+    logger.info(f"Spawning enrichment: {' '.join(cmd)}")
+    child_env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2])}
+    child_env.pop("PLAYWRIGHT_BROWSERS_PATH", None)
+    p = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        env=child_env,
+    )
+    logger.info(f"Enrichment child PID: {p.pid}")
+    return p
+
+
+def monitor_enrichment(proc, deadline, hang_timeout):
+    """Monitor an enrichment subprocess. Returns exit code or -1 on hang."""
+    last_progress = datetime.now()
+    last_enrichment_pct = -1
+
+    while True:
+        time.sleep(15)
+        if datetime.now() >= deadline:
+            logger.warning("Enrichment deadline reached — killing.")
+            kill_child(proc)
+            return -3
+
+        exit_code = proc.poll()
+        if exit_code is not None:
+            if exit_code == 0:
+                logger.info("Enrichment completed successfully.")
+            else:
+                logger.error(f"Enrichment crashed (exit {exit_code})")
+            return exit_code
+
+        hb = read_heartbeat()
+        if hb:
+            status = hb.get("status", "")
+            if status == "enriching":
+                pct = hb.get("enrichment_progress", 0)
+                if pct > last_enrichment_pct:
+                    last_enrichment_pct = pct
+                    last_progress = datetime.now()
+                elif (datetime.now() - last_progress).total_seconds() > hang_timeout:
+                    logger.error(f"Enrichment HANG at {pct}%")
+                    kill_child(proc)
+                    return -1
+                if int(time.time()) % 120 < 15:
+                    detail = hb.get("enrichment_detail", {})
+                    processed = detail.get("processed", "?")
+                    total = detail.get("total", "?")
+                    fields = detail.get("fields_updated_total", "?")
+                    logger.info(
+                        f"Enrichment OK | {processed}/{total} records "
+                        f"({pct}%) | {fields} fields updated"
+                    )
+            elif status in ("enrichment_complete", "completed"):
+                # Process hasn't exited yet but status says done — wait for clean exit
+                pass
+            else:
+                # Still in production mode heartbeat — treat total_records as progress
+                cur = hb.get("total_records", -1)
+                if cur > last_enrichment_pct:
+                    last_enrichment_pct = cur
+                    last_progress = datetime.now()
+                elif (datetime.now() - last_progress).total_seconds() > hang_timeout:
+                    logger.error("Enrichment HANG (no progress)")
+                    kill_child(proc)
+                    return -1
+        elif (datetime.now() - last_progress).total_seconds() > hang_timeout:
+            logger.error("No heartbeat during enrichment")
+            kill_child(proc)
+            return -2
+
+
 def kill_child(p):
     if p.poll() is not None:
         return
@@ -322,6 +397,37 @@ def main():
             if dx.get("action") == "abort":
                 break
         time.sleep(30)
+
+    # ── Phase 2: Enrichment Pass ──────────────────────────────────────────
+    db_state = read_db_state()
+    time_left = deadline - datetime.now()
+
+    if db_state.get("total", 0) >= 1000 and time_left > timedelta(minutes=30):
+        remaining_hours = time_left.total_seconds() / 3600
+        logger.info("=" * 70)
+        logger.info(
+            f"PHASE 2: ENRICHMENT | {remaining_hours:.1f}h remaining"
+        )
+        logger.info("=" * 70)
+
+        enrich_proc = spawn_enrichment(
+            args.llm_base_url, f"{remaining_hours:.1f}h"
+        )
+        enrich_exit = monitor_enrichment(enrich_proc, deadline, args.hang_timeout)
+
+        if enrich_exit != 0:
+            logger.warning(
+                f"Enrichment exited with code {enrich_exit}. "
+                f"May require manual re-run: "
+                f"python -m game_predictor.cli.run_production --enrich-only"
+            )
+    elif db_state.get("total", 0) < 1000:
+        logger.warning(
+            f"Production target not met ({db_state.get('total', 0)}/1000) "
+            f"— skipping enrichment phase."
+        )
+    else:
+        logger.info("Insufficient time remaining for enrichment phase.")
 
     db_final = read_db_state()
     logger.info("=" * 70)

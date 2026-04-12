@@ -60,24 +60,26 @@ async def process_google_candidate(
 
     body = article.body_text if article.body_text else f"A {name} gameplay session."
 
-    async with LLM_SEM:
-        narration = await generate_narration(body, name)
-    if narration is None or narration == SENTINEL_STR:
+    async def _narrate():
+        async with LLM_SEM:
+            n = await generate_narration(body, name)
+        if n and IMAGE_REF_PATTERN.search(n):
+            async with LLM_SEM:
+                n = await generate_narration(body, name)
+        return n
+
+    async def _assess():
+        async with LLM_SEM:
+            try:
+                return await assess_experience_level(img_path, body, name)
+            except Exception:
+                return SENTINEL_QUAL
+
+    narration, exp = await asyncio.gather(_narrate(), _assess())
+
+    if narration is None or narration == SENTINEL_STR or IMAGE_REF_PATTERN.search(narration or ""):
         Path(img_path).unlink(missing_ok=True)
         return False
-
-    if IMAGE_REF_PATTERN.search(narration):
-        async with LLM_SEM:
-            narration = await generate_narration(body, name)
-        if narration is None or IMAGE_REF_PATTERN.search(narration or ""):
-            Path(img_path).unlink(missing_ok=True)
-            return False
-
-    async with LLM_SEM:
-        try:
-            exp = await assess_experience_level(img_path, body, name)
-        except Exception:
-            exp = SENTINEL_QUAL
 
     record = GameplayRecord(
         video_game_name=name,
@@ -124,24 +126,26 @@ async def process_youtube_candidate(
 
     yt_context = video.get("description", "") or video.get("title", f"A {name} video.")
 
-    async with LLM_SEM:
-        narration = await generate_narration(yt_context, name)
-    if narration is None or narration == SENTINEL_STR:
+    async def _narrate():
+        async with LLM_SEM:
+            n = await generate_narration(yt_context, name)
+        if n and IMAGE_REF_PATTERN.search(n):
+            async with LLM_SEM:
+                n = await generate_narration(yt_context, name)
+        return n
+
+    async def _assess():
+        async with LLM_SEM:
+            try:
+                return await assess_experience_level(img_path, yt_context, name)
+            except Exception:
+                return SENTINEL_QUAL
+
+    narration, exp = await asyncio.gather(_narrate(), _assess())
+
+    if narration is None or narration == SENTINEL_STR or IMAGE_REF_PATTERN.search(narration or ""):
         Path(img_path).unlink(missing_ok=True)
         return False
-
-    if IMAGE_REF_PATTERN.search(narration):
-        async with LLM_SEM:
-            narration = await generate_narration(yt_context, name)
-        if narration is None or IMAGE_REF_PATTERN.search(narration or ""):
-            Path(img_path).unlink(missing_ok=True)
-            return False
-
-    async with LLM_SEM:
-        try:
-            exp = await assess_experience_level(img_path, yt_context, name)
-        except Exception:
-            exp = SENTINEL_QUAL
 
     record = GameplayRecord(
         video_game_name=name,
@@ -201,10 +205,10 @@ async def process_game(game: dict, conn):
     logger.info(f"[{name}] {len(unique_img)} unique Google Images candidates")
 
     google_target = min(140, target)
-    for batch_start in range(0, len(unique_img), 5):
+    for batch_start in range(0, len(unique_img), 8):
         if current_count() >= google_target or shutdown_requested:
             break
-        batch = unique_img[batch_start:batch_start + 5]
+        batch = unique_img[batch_start:batch_start + 8]
         tasks = []
         for r in batch:
             rid = conn.execute("SELECT nextval('gameplay_id_seq')").fetchone()[0]
@@ -233,10 +237,10 @@ async def process_game(game: dict, conn):
                 unique_yt.append(v)
         logger.info(f"[{name}] {len(unique_yt)} unique YouTube candidates")
 
-        for batch_start in range(0, len(unique_yt), 3):
+        for batch_start in range(0, len(unique_yt), 5):
             if current_count() >= target or shutdown_requested:
                 break
-            batch = unique_yt[batch_start:batch_start + 3]
+            batch = unique_yt[batch_start:batch_start + 5]
             tasks = []
             for v in batch:
                 rid = conn.execute("SELECT nextval('gameplay_id_seq')").fetchone()[0]

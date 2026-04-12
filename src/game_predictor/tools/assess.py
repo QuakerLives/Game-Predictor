@@ -22,7 +22,8 @@ logger = logging.getLogger(__name__)
 
 _VALID_EXPERIENCE_LEVELS = frozenset({"Poor", "Fair", "Good", "Excellent", "Superior"})
 _GENERATE_ENDPOINT = f"{OLLAMA_NATIVE_URL}/api/generate"
-_REQUEST_TIMEOUT = 60.0
+_REQUEST_TIMEOUT = 180.0
+_MAX_RETRIES = 2
 
 
 def _load_image_b64(image_path: str) -> str:
@@ -31,27 +32,54 @@ def _load_image_b64(image_path: str) -> str:
     return base64.b64encode(data).decode("utf-8")
 
 
-async def _call_ollama_multimodal(prompt: str, img_b64: str) -> str | None:
-    """Send a multimodal prompt to Gemma 4 via the Ollama native /api/generate endpoint."""
-    payload = {
+async def _call_ollama_multimodal(
+    prompt: str,
+    img_b64: str,
+    *,
+    think: bool = True,
+    num_predict: int | None = None,
+) -> str | None:
+    """Send a multimodal prompt to Gemma 4 via the Ollama native /api/generate endpoint.
+
+    For short-answer classification tasks (validation, assessment), set think=False
+    and a low num_predict to skip the internal reasoning phase — this reduces
+    latency from ~10-20s to <1s on Apple Silicon.
+    """
+    payload: dict = {
         "model": LLM_MODEL,
         "prompt": prompt,
         "images": [img_b64],
         "stream": False,
+        "think": think,
     }
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                _GENERATE_ENDPOINT,
-                json=payload,
-                timeout=_REQUEST_TIMEOUT,
+    if num_predict is not None:
+        payload["options"] = {"num_predict": num_predict}
+
+    timeout = _REQUEST_TIMEOUT if think else 120.0
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    _GENERATE_ENDPOINT,
+                    json=payload,
+                    timeout=timeout,
+                )
+                resp.raise_for_status()
+                return resp.json().get("response", "").strip()
+        except httpx.ReadTimeout:
+            logger.warning(
+                "Ollama multimodal timeout (attempt %d/%d, %.0fs limit)",
+                attempt, _MAX_RETRIES, timeout,
             )
-            resp.raise_for_status()
-            return resp.json().get("response", "").strip()
-    except httpx.HTTPStatusError as exc:
-        logger.error("Ollama returned %d: %s", exc.response.status_code, exc.response.text[:200])
-    except Exception:
-        logger.exception("Ollama native API call failed")
+            if attempt < _MAX_RETRIES:
+                continue
+            logger.error("Ollama multimodal timed out after %d attempts", _MAX_RETRIES)
+        except httpx.HTTPStatusError as exc:
+            logger.error("Ollama returned %d: %s", exc.response.status_code, exc.response.text[:200])
+            break
+        except Exception:
+            logger.exception("Ollama native API call failed")
+            break
     return None
 
 
@@ -80,10 +108,9 @@ async def assess_experience_level(
         f"{EXPERIENCE_USER.format(game_name=game_name, context=context_snippet)}"
     )
 
-    raw = await _call_ollama_multimodal(prompt, img_b64)
+    raw = await _call_ollama_multimodal(prompt, img_b64, think=False, num_predict=30)
 
     if raw:
-        # Extract the first valid level word from the response
         for word in raw.split():
             cleaned = word.strip(".,;:!?\"'()")
             if cleaned in _VALID_EXPERIENCE_LEVELS:
@@ -129,7 +156,7 @@ async def validate_gameplay_image(image_path: str, game_name: str) -> bool:
         f"then a brief reason on the second line."
     )
 
-    raw = await _call_ollama_multimodal(prompt, img_b64)
+    raw = await _call_ollama_multimodal(prompt, img_b64, think=False, num_predict=60)
 
     if raw:
         first_line = raw.strip().split("\n")[0].strip().upper()

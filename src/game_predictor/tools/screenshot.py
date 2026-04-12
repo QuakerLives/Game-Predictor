@@ -162,6 +162,138 @@ async def screenshot_youtube_video(
         await page.close()
 
 
+async def extract_channel_url_from_video(video_url: str) -> str | None:
+    """Navigate to a YouTube video page and extract the channel URL.
+
+    Returns the full channel URL (e.g. 'https://www.youtube.com/@ChannelName')
+    or None if extraction fails.
+    """
+    if not video_url or not video_url.strip():
+        return None
+
+    _, context = await _get_browser()
+    page = await context.new_page()
+    page.set_default_timeout(SCREENSHOT_TIMEOUT_MS)
+
+    try:
+        await page.goto(video_url, wait_until="domcontentloaded")
+        await page.wait_for_timeout(2_000)
+
+        # Try to dismiss consent dialog
+        try:
+            agree_btn = page.locator("button:has-text('Accept all')")
+            if await agree_btn.count() > 0:
+                await agree_btn.first.click(timeout=3_000)
+                await page.wait_for_timeout(1_000)
+        except Exception:
+            pass
+
+        # Extract channel URL from the video page
+        channel_href = await page.evaluate("""
+            (() => {
+                // Try multiple selectors for the channel link
+                const selectors = [
+                    '#owner a[href*="/@"]',
+                    'ytd-video-owner-renderer a[href*="/@"]',
+                    'a.yt-simple-endpoint[href*="/@"]',
+                    '#channel-name a',
+                    'ytd-channel-name a',
+                    '#owner a[href*="/channel/"]',
+                    'a[href*="/c/"]',
+                ];
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el && el.href) return el.href;
+                }
+                return null;
+            })()
+        """)
+
+        if channel_href:
+            logger.info("Extracted channel URL: %s from %s", channel_href, video_url)
+        return channel_href
+
+    except Exception:
+        logger.exception("Failed to extract channel URL from %s", video_url)
+        return None
+    finally:
+        await page.close()
+
+
+async def extract_youtube_video_metadata(video_url: str) -> dict:
+    """Navigate to a YouTube video page and extract player name and upload date.
+
+    Returns a dict with keys: channel_name, upload_date (str or None).
+    """
+    result = {"channel_name": None, "upload_date": None}
+
+    if not video_url or not video_url.strip():
+        return result
+
+    _, context = await _get_browser()
+    page = await context.new_page()
+    page.set_default_timeout(SCREENSHOT_TIMEOUT_MS)
+
+    try:
+        await page.goto(video_url, wait_until="domcontentloaded")
+        await page.wait_for_timeout(2_000)
+
+        # Dismiss consent if needed
+        try:
+            agree_btn = page.locator("button:has-text('Accept all')")
+            if await agree_btn.count() > 0:
+                await agree_btn.first.click(timeout=3_000)
+                await page.wait_for_timeout(1_000)
+        except Exception:
+            pass
+
+        metadata = await page.evaluate("""
+            (() => {
+                const result = {channel_name: null, upload_date: null};
+
+                // Channel name
+                const chanSelectors = [
+                    '#owner ytd-channel-name yt-formatted-string a',
+                    '#channel-name a',
+                    'ytd-video-owner-renderer #channel-name a',
+                    '#owner a[href*="/@"]',
+                ];
+                for (const sel of chanSelectors) {
+                    const el = document.querySelector(sel);
+                    if (el && el.textContent.trim()) {
+                        result.channel_name = el.textContent.trim();
+                        break;
+                    }
+                }
+
+                // Upload date from info section
+                const dateSelectors = [
+                    '#info-strings yt-formatted-string',
+                    'ytd-video-primary-info-renderer #info-strings span',
+                    '#info span',
+                ];
+                for (const sel of dateSelectors) {
+                    const el = document.querySelector(sel);
+                    if (el && el.textContent.trim()) {
+                        result.upload_date = el.textContent.trim();
+                        break;
+                    }
+                }
+                return result;
+            })()
+        """)
+
+        result["channel_name"] = metadata.get("channel_name")
+        result["upload_date"] = metadata.get("upload_date")
+        return result
+
+    except Exception:
+        logger.exception("Failed to extract video metadata from %s", video_url)
+        return result
+    finally:
+        await page.close()
+
+
 async def extract_youtube_channel_info(channel_url: str) -> dict:
     """Navigate to a YouTube channel's about page and extract metadata.
 
@@ -192,12 +324,33 @@ async def extract_youtube_channel_info(channel_url: str) -> dict:
 
         description = await page.evaluate("""
             (() => {
-                const el = document.querySelector(
-                    '#description-container yt-formatted-string, '
-                    + 'yt-formatted-string#bio, '
-                    + '[class*="description"] yt-formatted-string'
-                );
-                return el ? el.innerText.trim() : null;
+                // Try the About tab selectors first (current YouTube layout)
+                const aboutSelectors = [
+                    '#description-container yt-formatted-string',
+                    'yt-formatted-string#bio',
+                    '#about-description yt-formatted-string',
+                    'ytd-channel-about-metadata-renderer #description',
+                    '[class*="description"] yt-formatted-string',
+                ];
+                for (const sel of aboutSelectors) {
+                    const el = document.querySelector(sel);
+                    if (el && el.innerText && el.innerText.trim().length > 10) {
+                        return el.innerText.trim();
+                    }
+                }
+                // Fallback: channel header tagline/description
+                const headerSelectors = [
+                    '#channel-header-container #channel-tagline',
+                    'yt-formatted-string#channel-handle',
+                    '#channel-header yt-formatted-string',
+                ];
+                for (const sel of headerSelectors) {
+                    const el = document.querySelector(sel);
+                    if (el && el.innerText && el.innerText.trim().length > 10) {
+                        return el.innerText.trim();
+                    }
+                }
+                return null;
             })()
         """)
 

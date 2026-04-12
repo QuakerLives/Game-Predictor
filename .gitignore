@@ -57,6 +57,7 @@ cover/
 
 # DuckDB stuff:
 *.duckdb
+*.duckdb.wal
 
 # Django stuff:
 *.log

@@ -43,6 +43,7 @@ class _LLMHolder:
                 temperature=LLM_TEMPERATURE,
                 max_tokens=LLM_MAX_TOKENS,
                 api_key="not-needed",
+                timeout=180.0,
             )
         return cls._instance
 
@@ -59,8 +60,8 @@ def _passes_independence_check(text: str) -> bool:
 
 @retry(
     retry=retry_if_exception_type(Exception),
-    stop=stop_after_attempt(2),
-    wait=wait_fixed(2),
+    stop=stop_after_attempt(3),
+    wait=wait_fixed(5),
     reraise=True,
 )
 async def _call_llm(messages: list) -> str:

@@ -74,23 +74,168 @@ async def _delay(seconds: float = 2.0) -> None:
 # ── CAPTCHA Solver (Gemma 4 multimodal) ──────────────────────────────────
 
 
-async def _attempt_captcha_solve(page) -> bool:
-    """Use Gemma 4 to analyze and attempt to solve a Google CAPTCHA.
-
-    Takes a screenshot of the current page, sends it to Gemma 4 for analysis,
-    and follows the model's instructions to interact with CAPTCHA elements.
-    Returns True if the CAPTCHA appears solved, False otherwise.
-    """
+async def _gemma4_vision(page_or_bytes, prompt: str) -> str | None:
+    """Send a screenshot to Gemma 4 multimodal and return the text response."""
     import base64
     import httpx
     from game_predictor.config import LLM_MODEL, OLLAMA_NATIVE_URL
 
-    logger.info("Attempting CAPTCHA solve via Gemma 4 multimodal")
+    if isinstance(page_or_bytes, bytes):
+        img_b64 = base64.b64encode(page_or_bytes).decode("utf-8")
+    else:
+        img_b64 = base64.b64encode(
+            await page_or_bytes.screenshot(full_page=False)
+        ).decode("utf-8")
 
     try:
-        screenshot_bytes = await page.screenshot(full_page=False)
-        img_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{OLLAMA_NATIVE_URL}/api/generate",
+                json={
+                    "model": LLM_MODEL,
+                    "prompt": prompt,
+                    "images": [img_b64],
+                    "stream": False,
+                },
+                timeout=180.0,
+            )
+            resp.raise_for_status()
+            return resp.json().get("response", "").strip()
+    except Exception:
+        logger.exception("Gemma 4 vision call failed")
+        return None
 
+
+async def _solve_image_grid(page, max_rounds: int = 3) -> bool:
+    """Solve a reCAPTCHA image grid challenge using Gemma 4 vision.
+
+    Takes a screenshot of the challenge iframe, asks Gemma 4 to identify
+    which tiles match the prompt, clicks them, and submits. Handles
+    multi-round challenges where new tiles appear after selection.
+    """
+    challenge_frame = page.frame_locator("iframe[title*='recaptcha challenge']")
+
+    for round_num in range(1, max_rounds + 1):
+        logger.info("CAPTCHA grid solve attempt %d/%d", round_num, max_rounds)
+
+        await page.wait_for_timeout(1500)
+
+        try:
+            challenge_iframe_el = page.locator("iframe[title*='recaptcha challenge']")
+            if await challenge_iframe_el.count() == 0:
+                logger.info("Challenge iframe gone — CAPTCHA may be solved")
+                return True
+            screenshot_bytes = await challenge_iframe_el.screenshot()
+        except Exception:
+            logger.warning("Could not screenshot challenge iframe")
+            return False
+
+        prompt = (
+            "You are looking at a reCAPTCHA image grid challenge.\n\n"
+            "The grid is laid out in rows and columns. Each tile has a position:\n"
+            "  Row 1: tiles 1, 2, 3 (top row, left to right)\n"
+            "  Row 2: tiles 4, 5, 6 (middle row)\n"
+            "  Row 3: tiles 7, 8, 9 (bottom row)\n"
+            "For a 4x4 grid:\n"
+            "  Row 1: tiles 1, 2, 3, 4\n"
+            "  Row 2: tiles 5, 6, 7, 8\n"
+            "  Row 3: tiles 9, 10, 11, 12\n"
+            "  Row 4: tiles 13, 14, 15, 16\n\n"
+            "1. Read the instruction text at the top (e.g. 'Select all images with traffic lights').\n"
+            "2. Identify the grid size (3x3 or 4x4).\n"
+            "3. Determine which tiles match the instruction.\n\n"
+            "Answer as JSON ONLY:\n"
+            '{"instruction": "what it asks", "grid_size": 3, '
+            '"matching_tiles": [1, 5, 7], "confidence": "high"|"medium"|"low"}'
+        )
+
+        raw = await _gemma4_vision(screenshot_bytes, prompt)
+        if not raw:
+            logger.warning("Gemma 4 returned no response for grid analysis")
+            return False
+
+        logger.info("Grid analysis (round %d): %s", round_num, raw[:200])
+
+        import json as _json
+        cleaned = raw
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        try:
+            result = _json.loads(cleaned)
+        except _json.JSONDecodeError:
+            logger.warning("Could not parse grid analysis JSON")
+            return False
+
+        tiles = result.get("matching_tiles", [])
+        grid_size = result.get("grid_size", 3)
+        confidence = result.get("confidence", "low")
+
+        if not tiles:
+            logger.warning("Gemma 4 found no matching tiles — skipping")
+            return False
+
+        if confidence == "low":
+            logger.warning("Low confidence on tile selection — skipping to avoid lockout")
+            return False
+
+        logger.info(
+            "Clicking tiles %s (%dx%d grid, confidence: %s)",
+            tiles, grid_size, grid_size, confidence,
+        )
+
+        tile_selector = "td.rc-imageselect-tile, div.rc-imageselect-tile"
+        for tile_num in tiles:
+            idx = tile_num - 1
+            try:
+                tile = challenge_frame.locator(tile_selector).nth(idx)
+                await tile.click(timeout=3000)
+                await page.wait_for_timeout(300)
+            except Exception:
+                logger.debug("Could not click tile %d", tile_num)
+
+        await page.wait_for_timeout(1000)
+
+        try:
+            verify_btn = challenge_frame.locator(
+                "#recaptcha-verify-button, button:has-text('Verify'), "
+                "button:has-text('Skip')"
+            )
+            if await verify_btn.count() > 0:
+                await verify_btn.first.click(timeout=3000)
+                logger.info("Clicked verify/submit button")
+                await page.wait_for_timeout(3000)
+        except Exception:
+            logger.debug("Could not click verify button")
+
+        challenge_still = page.locator("iframe[title*='recaptcha challenge']")
+        if await challenge_still.count() == 0:
+            logger.info("CAPTCHA challenge iframe gone — solved!")
+            return True
+
+        try:
+            error_msg = challenge_frame.locator(
+                ".rc-imageselect-error-select-more, "
+                ".rc-imageselect-incorrect-response"
+            )
+            if await error_msg.count() > 0:
+                logger.info("CAPTCHA wants more selections or got wrong answer, retrying")
+                continue
+        except Exception:
+            pass
+
+    logger.warning("Exhausted %d CAPTCHA solve attempts", max_rounds)
+    return False
+
+
+async def _attempt_captcha_solve(page) -> bool:
+    """Use Gemma 4 vision to analyze and solve a Google CAPTCHA.
+
+    Handles consent dialogs, checkbox challenges, and image grid challenges.
+    Returns True if the CAPTCHA appears solved, False otherwise.
+    """
+    logger.info("Attempting CAPTCHA solve via Gemma 4 multimodal vision")
+
+    try:
         prompt = (
             "You are looking at a Google CAPTCHA or consent page.\n\n"
             "Describe exactly what you see:\n"
@@ -102,19 +247,9 @@ async def _attempt_captcha_solve(page) -> bool:
             "\"instruction\": \"what the page asks\", \"action\": \"what to click or do\"}"
         )
 
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"{OLLAMA_NATIVE_URL}/api/generate",
-                json={
-                    "model": LLM_MODEL,
-                    "prompt": prompt,
-                    "images": [img_b64],
-                    "stream": False,
-                },
-                timeout=60.0,
-            )
-            resp.raise_for_status()
-            raw = resp.json().get("response", "").strip()
+        raw = await _gemma4_vision(page, prompt)
+        if not raw:
+            return False
 
         logger.info("CAPTCHA analysis: %s", raw[:200])
 
@@ -134,10 +269,10 @@ async def _attempt_captcha_solve(page) -> bool:
             await page.wait_for_timeout(2000)
             return True
 
-        if captcha_type == "checkbox":
-            try:
-                checkbox = page.locator("iframe[title*='reCAPTCHA']")
-                if await checkbox.count() > 0:
+        if captcha_type in ("checkbox", "recaptcha_grid"):
+            checkbox_iframe = page.locator("iframe[title*='reCAPTCHA']")
+            if captcha_type == "checkbox" and await checkbox_iframe.count() > 0:
+                try:
                     frame = page.frame_locator("iframe[title*='reCAPTCHA']")
                     await frame.locator(".recaptcha-checkbox-border").click(timeout=5000)
                     await page.wait_for_timeout(3000)
@@ -146,15 +281,15 @@ async def _attempt_captcha_solve(page) -> bool:
                     if await challenge_frame.count() == 0:
                         logger.info("CAPTCHA checkbox click succeeded — no challenge appeared")
                         return True
-                    logger.info("CAPTCHA checkbox triggered image challenge")
-            except Exception:
-                logger.debug("Checkbox click failed")
+                    logger.info("Checkbox triggered image grid — attempting vision solve")
+                except Exception:
+                    logger.debug("Checkbox click failed, checking for existing grid")
 
-        if captcha_type == "recaptcha_grid":
-            logger.warning(
-                "reCAPTCHA image grid detected — Gemma 4 cannot reliably solve grid challenges. "
-                "Falling back to Bing."
-            )
+            challenge_frame = page.locator("iframe[title*='recaptcha challenge']")
+            if await challenge_frame.count() > 0:
+                return await _solve_image_grid(page)
+
+            logger.warning("No challenge iframe found to solve")
             return False
 
         logger.warning("Unknown CAPTCHA type: %s — cannot solve", captcha_type)
@@ -188,25 +323,35 @@ async def search_google_images(
         await page.goto(url, wait_until="domcontentloaded", timeout=20000)
         await dismiss_cookie_consent(page)
 
-        # Wait for the image grid
-        try:
-            await page.wait_for_selector("div#search img, div#islrg img", timeout=10000)
-        except Exception:
+        # Wait for the image grid — try multiple selector strategies
+        grid_selectors = [
+            "div#search img, div#islrg img",
+            "div#rso img, img.YQ4gaf, img.Q4LuWd",
+            "div[data-ri] img, img.rg_i",
+        ]
+        grid_loaded = False
+        for sel in grid_selectors:
+            try:
+                await page.wait_for_selector(sel, timeout=5000)
+                grid_loaded = True
+                break
+            except Exception:
+                continue
+
+        if not grid_loaded:
             logger.warning("Image grid did not load — possible CAPTCHA, attempting solve")
             solved = await _attempt_captcha_solve(page)
             if solved:
-                try:
-                    await page.wait_for_selector(
-                        "div#search img, div#islrg img", timeout=10000
-                    )
-                    logger.info("CAPTCHA solved — Google Images grid loaded")
-                except Exception:
-                    logger.warning("CAPTCHA solve did not restore image grid — falling back to Bing")
-                    await browser.close()
-                    await pw.stop()
-                    return await search_bing_images(query, num_results)
-            else:
-                logger.warning("CAPTCHA solve failed — falling back to Bing")
+                for sel in grid_selectors:
+                    try:
+                        await page.wait_for_selector(sel, timeout=5000)
+                        grid_loaded = True
+                        logger.info("CAPTCHA solved — Google Images grid loaded")
+                        break
+                    except Exception:
+                        continue
+            if not grid_loaded:
+                logger.warning("Google Images unavailable — falling back to Bing")
                 await browser.close()
                 await pw.stop()
                 return await search_bing_images(query, num_results)
@@ -216,13 +361,25 @@ async def search_google_images(
             await page.evaluate("window.scrollBy(0, window.innerHeight)")
             await _delay(1.0)
 
-        thumbnails = await page.query_selector_all(
-            "div#search img[data-src], div#islrg img"
-        )
-        if not thumbnails:
-            thumbnails = await page.query_selector_all("img.Q4LuWd, img.rg_i")
+        thumbnails = []
+        thumb_selectors = [
+            "div#search img[data-src], div#islrg img",
+            "img.Q4LuWd, img.rg_i, img.YQ4gaf",
+            "div[data-ri] img",
+            "div#rso img[src^='http']",
+        ]
+        for sel in thumb_selectors:
+            thumbnails = await page.query_selector_all(sel)
+            if thumbnails:
+                break
 
         logger.info("Found %d thumbnails for '%s'", len(thumbnails), query)
+
+        if not thumbnails:
+            logger.warning("Google returned 0 thumbnails despite grid load — falling back to Bing")
+            await browser.close()
+            await pw.stop()
+            return await search_bing_images(query, num_results)
 
         for thumb in thumbnails[: num_results + 10]:
             if len(results) >= num_results:
@@ -332,28 +489,14 @@ async def search_bing_images(
             if len(results) >= num_results:
                 break
             try:
-                # Bing stores metadata in an 'm' attribute as JSON
                 m_attr = await thumb.get_attribute("m") or ""
                 img_el = await thumb.query_selector("img")
 
-                await thumb.scroll_into_view_if_needed()
-                await thumb.click()
-                await _delay(2.0)
-
-                # Try the expanded panel
-                full_img_el = await page.query_selector(
-                    "img.nofocus, #mainImageWindow img, .imgContainer img"
-                )
                 image_url = ""
-                if full_img_el:
-                    image_url = await full_img_el.get_attribute("src") or ""
-
-                if not image_url or image_url.startswith("data:"):
-                    # Parse from the 'm' JSON attribute
-                    if '"murl":"' in m_attr:
-                        start = m_attr.index('"murl":"') + 8
-                        end = m_attr.index('"', start)
-                        image_url = m_attr[start:end]
+                if '"murl":"' in m_attr:
+                    start = m_attr.index('"murl":"') + 8
+                    end = m_attr.index('"', start)
+                    image_url = m_attr[start:end]
 
                 if not image_url:
                     continue

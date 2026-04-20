@@ -103,105 +103,73 @@ async def heartbeat_loop(conn):
     }))
 
 
-async def _enrich_google_record(
+def _is_youtube_url(url: str) -> bool:
+    """Check if a URL points to YouTube regardless of source_type."""
+    return "youtube.com/" in url or "youtu.be/" in url
+
+
+_EXP_ENUM = ("Poor", "Fair", "Good", "Excellent", "Superior")
+
+
+async def _assess_experience(
+    record_id: int,
+    image_path: str,
+    game_name: str,
+    context_text: str = "",
+) -> str | None:
+    """Run experience assessment with timeout. Returns valid enum value or None."""
+    if not image_path or not Path(image_path).exists():
+        return None
+    try:
+        exp = await asyncio.wait_for(
+            assess_experience_level(image_path, context_text, game_name),
+            timeout=ENRICHMENT_LLM_TIMEOUT,
+        )
+        if exp and exp in _EXP_ENUM:
+            return exp
+    except asyncio.TimeoutError:
+        logger.warning(f"[enrich:{record_id}] Experience assessment timed out")
+    except Exception as e:
+        logger.warning(f"[enrich:{record_id}] Experience assessment failed: {e}")
+    return None
+
+
+async def _article_phase(
     record_id: int,
     source_url: str,
     game_name: str,
-    image_path: str,
-    current: dict,
-    browser_sem: asyncio.Semaphore,
-    llm_sem: asyncio.Semaphore,
-) -> dict[str, object]:
-    """Re-extract data for a single Google Images record.
-
-    Returns a dict of {field: new_value} for fields successfully enriched.
-    Fields that fail extraction are omitted (left NULL).
-    """
-    updates: dict[str, object] = {}
-
-    # Phase 1: Re-extract article data from source URL
-    article = None
+):
+    """Phase 1 for articles: extract structured data. Returns ArticleData or None."""
     try:
-        async with browser_sem:
-            article = await asyncio.wait_for(
-                click_article_and_extract(source_url, game_name),
-                timeout=ENRICHMENT_BROWSER_TIMEOUT,
-            )
+        return await asyncio.wait_for(
+            click_article_and_extract(source_url, game_name),
+            timeout=ENRICHMENT_BROWSER_TIMEOUT,
+        )
     except asyncio.TimeoutError:
         logger.warning(f"[enrich:{record_id}] Article extraction timed out")
     except Exception as e:
         logger.warning(f"[enrich:{record_id}] Article extraction failed: {e}")
-
-    if article:
-        if current.get("player_name") is None and article.author_name != SENTINEL_STR:
-            updates["player_name"] = article.author_name
-
-        if current.get("gameplay_timestamp") is None and article.publish_date != SENTINEL_TIMESTAMP:
-            updates["gameplay_timestamp"] = article.publish_date
-
-        if current.get("identifying_quotes") is None and article.identifying_quotes != SENTINEL_QUOTES:
-            updates["identifying_quotes"] = article.identifying_quotes
-
-        if current.get("channel_description") is None and article.site_description != SENTINEL_STR:
-            updates["channel_description"] = article.site_description
-
-        if current.get("player_experience_narration") is None and article.player_experience_summary != SENTINEL_STR:
-            updates["player_experience_narration"] = article.player_experience_summary
-
-        if current.get("gameplay_level") is None and article.gameplay_level != SENTINEL_INT:
-            updates["gameplay_level"] = article.gameplay_level
-
-        if current.get("total_playtime") is None and article.total_playtime != SENTINEL_INT:
-            updates["total_playtime"] = article.total_playtime
-
-    # Phase 2: Re-assess experience level using existing image
-    if current.get("experience_level") is None and image_path and Path(image_path).exists():
-        context_text = ""
-        if article and article.body_text:
-            context_text = article.body_text[:500]
-        try:
-            async with llm_sem:
-                exp = await asyncio.wait_for(
-                    assess_experience_level(image_path, context_text, game_name, model=ENRICHMENT_LLM_MODEL),
-                    timeout=ENRICHMENT_LLM_TIMEOUT,
-                )
-            if exp and exp != SENTINEL_QUAL:
-                updates["experience_level"] = exp
-        except asyncio.TimeoutError:
-            logger.warning(f"[enrich:{record_id}] Experience assessment timed out")
-        except Exception as e:
-            logger.warning(f"[enrich:{record_id}] Experience assessment failed: {e}")
-
-    return updates
+    return None
 
 
-async def _enrich_youtube_record(
+async def _youtube_phase(
     record_id: int,
     source_url: str,
-    game_name: str,
-    image_path: str,
     current: dict,
-    browser_sem: asyncio.Semaphore,
-    llm_sem: asyncio.Semaphore,
 ) -> dict[str, object]:
-    """Re-extract data for a single YouTube record.
-
-    Returns a dict of {field: new_value} for fields successfully enriched.
-    """
+    """Phase 1 for YouTube: extract video metadata + channel description."""
     updates: dict[str, object] = {}
 
-    # Phase 1a: Extract video metadata (channel name, upload date)
+    # Sub-phase 1a: video metadata (channel name + upload date)
     if current.get("player_name") is None or current.get("gameplay_timestamp") is None:
         try:
-            async with browser_sem:
-                meta = await asyncio.wait_for(
-                    extract_youtube_video_metadata(source_url),
-                    timeout=ENRICHMENT_BROWSER_TIMEOUT,
-                )
+            meta = await asyncio.wait_for(
+                extract_youtube_video_metadata(source_url),
+                timeout=ENRICHMENT_BROWSER_TIMEOUT,
+            )
             if current.get("player_name") is None and meta.get("channel_name"):
                 updates["player_name"] = meta["channel_name"]
             if current.get("gameplay_timestamp") is None and meta.get("upload_date"):
-                # Try to parse the date string from YouTube
                 from dateutil import parser as dateparser
                 try:
                     updates["gameplay_timestamp"] = dateparser.parse(meta["upload_date"])
@@ -212,21 +180,19 @@ async def _enrich_youtube_record(
         except Exception as e:
             logger.warning(f"[enrich:{record_id}] YouTube metadata extraction failed: {e}")
 
-    # Phase 1b: Fix channel description (the big one — 99.4% sentinel for YouTube)
-    if current.get("channel_description") is None or current.get("player_experience_narration") is None:
+    # Sub-phase 1b: channel description
+    if (current.get("channel_description") is None
+            or current.get("player_experience_narration") is None):
         try:
-            # First extract the channel URL from the video page
-            async with browser_sem:
-                channel_url = await asyncio.wait_for(
-                    extract_channel_url_from_video(source_url),
+            channel_url = await asyncio.wait_for(
+                extract_channel_url_from_video(source_url),
+                timeout=ENRICHMENT_BROWSER_TIMEOUT,
+            )
+            if channel_url:
+                channel_info = await asyncio.wait_for(
+                    extract_youtube_channel_info(channel_url),
                     timeout=ENRICHMENT_BROWSER_TIMEOUT,
                 )
-            if channel_url:
-                async with browser_sem:
-                    channel_info = await asyncio.wait_for(
-                        extract_youtube_channel_info(channel_url),
-                        timeout=ENRICHMENT_BROWSER_TIMEOUT,
-                    )
                 desc = channel_info.get("description")
                 if desc and desc != SENTINEL_STR:
                     if current.get("channel_description") is None:
@@ -238,21 +204,111 @@ async def _enrich_youtube_record(
         except Exception as e:
             logger.warning(f"[enrich:{record_id}] YouTube channel extraction failed: {e}")
 
-    # Phase 2: Re-assess experience level
-    if current.get("experience_level") is None and image_path and Path(image_path).exists():
-        context_text = ""
-        try:
-            async with llm_sem:
-                exp = await asyncio.wait_for(
-                    assess_experience_level(image_path, context_text, game_name, model=ENRICHMENT_LLM_MODEL),
-                    timeout=ENRICHMENT_LLM_TIMEOUT,
-                )
-            if exp and exp != SENTINEL_QUAL:
-                updates["experience_level"] = exp
-        except asyncio.TimeoutError:
-            logger.warning(f"[enrich:{record_id}] Experience assessment timed out")
-        except Exception as e:
-            logger.warning(f"[enrich:{record_id}] Experience assessment failed: {e}")
+    return updates
+
+
+async def _enrich_article_record(
+    record_id: int,
+    source_url: str,
+    game_name: str,
+    image_path: str,
+    current: dict,
+) -> dict[str, object]:
+    """Enrich a non-YouTube record.
+
+    Runs Phase 1 (article extraction) and Phase 2 (image assessment) concurrently
+    so experience_level is always attempted even if article extraction times out.
+    Skips Phase 1 entirely if all article-derivable fields are already populated.
+    """
+    updates: dict[str, object] = {}
+
+    article_fields = (
+        "player_name", "gameplay_timestamp", "identifying_quotes",
+        "channel_description", "player_experience_narration",
+        "gameplay_level", "total_playtime",
+    )
+    needs_article = any(current.get(f) is None for f in article_fields)
+    needs_experience = current.get("experience_level") is None
+
+    tasks = []
+    if needs_article:
+        tasks.append(("article", _article_phase(record_id, source_url, game_name)))
+    if needs_experience:
+        tasks.append(("experience", _assess_experience(record_id, image_path, game_name)))
+
+    if not tasks:
+        return updates  # nothing to do
+
+    results = await asyncio.gather(*(t[1] for t in tasks), return_exceptions=True)
+    named = {name: res for (name, _), res in zip(tasks, results)}
+
+    # Apply experience assessment result
+    exp_result = named.get("experience")
+    if isinstance(exp_result, str):
+        updates["experience_level"] = exp_result
+
+    # Apply article extraction result
+    article = named.get("article")
+    if article is not None and not isinstance(article, Exception):
+        if current.get("player_name") is None and article.author_name != SENTINEL_STR:
+            updates["player_name"] = article.author_name
+        if current.get("gameplay_timestamp") is None and article.publish_date != SENTINEL_TIMESTAMP:
+            updates["gameplay_timestamp"] = article.publish_date
+        if current.get("identifying_quotes") is None and article.identifying_quotes != SENTINEL_QUOTES:
+            updates["identifying_quotes"] = article.identifying_quotes
+        if current.get("channel_description") is None and article.site_description != SENTINEL_STR:
+            updates["channel_description"] = article.site_description
+        if current.get("player_experience_narration") is None and article.player_experience_summary != SENTINEL_STR:
+            updates["player_experience_narration"] = article.player_experience_summary
+        if current.get("gameplay_level") is None and article.gameplay_level != SENTINEL_INT:
+            updates["gameplay_level"] = article.gameplay_level
+        if current.get("total_playtime") is None and article.total_playtime != SENTINEL_INT:
+            updates["total_playtime"] = article.total_playtime
+
+    return updates
+
+
+async def _enrich_youtube_record(
+    record_id: int,
+    source_url: str,
+    game_name: str,
+    image_path: str,
+    current: dict,
+) -> dict[str, object]:
+    """Enrich a YouTube record.
+
+    Runs YouTube browser phase and image assessment concurrently so
+    experience_level is assessed even if browser work times out.
+    Skips browser phase entirely if all its target fields are populated.
+    """
+    updates: dict[str, object] = {}
+
+    yt_fields = (
+        "player_name", "gameplay_timestamp",
+        "channel_description", "player_experience_narration",
+    )
+    needs_yt = any(current.get(f) is None for f in yt_fields)
+    needs_experience = current.get("experience_level") is None
+
+    tasks = []
+    if needs_yt:
+        tasks.append(("youtube", _youtube_phase(record_id, source_url, current)))
+    if needs_experience:
+        tasks.append(("experience", _assess_experience(record_id, image_path, game_name)))
+
+    if not tasks:
+        return updates
+
+    results = await asyncio.gather(*(t[1] for t in tasks), return_exceptions=True)
+    named = {name: res for (name, _), res in zip(tasks, results)}
+
+    exp_result = named.get("experience")
+    if isinstance(exp_result, str):
+        updates["experience_level"] = exp_result
+
+    yt_result = named.get("youtube")
+    if isinstance(yt_result, dict):
+        updates.update(yt_result)
 
     return updates
 
@@ -261,16 +317,29 @@ async def enrichment_pass(conn, deadline: datetime):
     """Full enrichment pass: re-extract sentinel-contaminated fields from
     source URLs. After schema migration, sentinels become NULLs, and this
     function attempts to fill them with real data. On failure, fields stay NULL.
-    """
-    from asyncio import Semaphore
-    LLM_SEM = Semaphore(LLM_CONCURRENCY)
-    BROWSER_SEM = Semaphore(BROWSER_CONCURRENCY)
 
+    Records are processed sequentially (one at a time) to avoid browser
+    resource contention — each gets the full CPU/memory/network bandwidth.
+    """
     logger.info("=" * 50)
     logger.info("  ENRICHMENT PASS")
     logger.info("=" * 50)
 
     cutoff = deadline - timedelta(minutes=15)
+
+    # Suppress noisy Playwright TargetClosedError futures
+    _original_handler = asyncio.get_event_loop().get_exception_handler()
+
+    def _suppress_target_closed(loop, context):
+        exc = context.get("exception")
+        if exc and "TargetClosedError" in type(exc).__name__:
+            return  # silently discard
+        if _original_handler:
+            _original_handler(loop, context)
+        else:
+            loop.default_exception_handler(context)
+
+    asyncio.get_event_loop().set_exception_handler(_suppress_target_closed)
 
     # Run schema migration (idempotent)
     migration_counts = migrate_schema_for_enrichment(conn)
@@ -312,87 +381,80 @@ async def enrichment_pass(conn, deadline: datetime):
     enriched_count = 0
     fields_updated_total = 0
 
-    for batch_start in range(0, total_to_enrich, ENRICHMENT_BATCH_SIZE):
+    # Process records one at a time — gives each the full browser/LLM bandwidth
+    for idx, row in enumerate(contaminated):
         if datetime.now() > cutoff or shutdown_requested:
             logger.warning("Enrichment cutoff reached — stopping.")
             break
 
-        batch = contaminated[batch_start:batch_start + ENRICHMENT_BATCH_SIZE]
-        tasks = []
+        row_dict = dict(zip(col_names, row))
+        record_id = row_dict["id"]
+        source_url = row_dict["source_url"]
+        game_name = row_dict["video_game_name"]
+        image_path = row_dict["image_path"]
+        current = {k: row_dict[k] for k in col_names[5:]}
 
-        for row in batch:
-            row_dict = dict(zip(col_names, row))
-            record_id = row_dict["id"]
-            source_url = row_dict["source_url"]
-            source_type = row_dict["source_type"]
-            game_name = row_dict["video_game_name"]
-            image_path = row_dict["image_path"]
-            current = {k: row_dict[k] for k in col_names[5:]}  # enrichable fields
+        # Route by URL content, not source_type — many YouTube URLs have
+        # source_type="google_images" because they were found via Google.
+        is_youtube = _is_youtube_url(source_url)
 
-            if source_type == "youtube":
-                coro = _enrich_youtube_record(
-                    record_id, source_url, game_name, image_path,
-                    current, BROWSER_SEM, LLM_SEM,
+        try:
+            if is_youtube:
+                updates = await asyncio.wait_for(
+                    _enrich_youtube_record(
+                        record_id, source_url, game_name, image_path, current,
+                    ),
+                    timeout=ENRICHMENT_RECORD_TIMEOUT,
                 )
             else:
-                coro = _enrich_google_record(
-                    record_id, source_url, game_name, image_path,
-                    current, BROWSER_SEM, LLM_SEM,
+                updates = await asyncio.wait_for(
+                    _enrich_article_record(
+                        record_id, source_url, game_name, image_path, current,
+                    ),
+                    timeout=ENRICHMENT_RECORD_TIMEOUT,
                 )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[enrich:{record_id}] Overall timeout ({ENRICHMENT_RECORD_TIMEOUT}s)"
+            )
+            updates = {}
+        except Exception as e:
+            logger.error(f"[enrich:{record_id}] Unexpected error: {e}")
+            updates = {}
 
-            # Wrap each record in an overall timeout
-            async def _bounded_enrich(rid=record_id, c=coro):
-                try:
-                    return rid, await asyncio.wait_for(c, timeout=ENRICHMENT_RECORD_TIMEOUT)
-                except asyncio.TimeoutError:
-                    logger.warning(f"[enrich:{rid}] Overall record timeout ({ENRICHMENT_RECORD_TIMEOUT}s)")
-                    return rid, {}
-                except Exception as e:
-                    logger.error(f"[enrich:{rid}] Unexpected error: {e}")
-                    return rid, {}
+        if updates:
+            n = update_record_fields(conn, record_id, updates)
+            fields_updated_total += n
+            enriched_count += 1
+            logger.info(
+                f"[enrich:{record_id}] Updated {n} fields: {list(updates.keys())}"
+            )
 
-            tasks.append(_bounded_enrich())
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for result in results:
-            if isinstance(result, Exception):
-                logger.error(f"Enrichment task exception: {result}")
-                continue
-            rid, updates = result
-            if updates:
-                n = update_record_fields(conn, rid, updates)
-                fields_updated_total += n
-                enriched_count += 1
-                logger.info(
-                    f"[enrich:{rid}] Updated {n} fields: {list(updates.keys())}"
-                )
-            else:
-                logger.debug(f"[enrich:{rid}] No new data extracted.")
-
-        # Update heartbeat
-        progress = int(((batch_start + len(batch)) / total_to_enrich) * 100)
-        heartbeat = {
-            "timestamp": datetime.now().isoformat(),
-            "pid": os.getpid(),
-            "total_records": conn.execute(
-                "SELECT COUNT(*) FROM gameplay_records"
-            ).fetchone()[0],
-            "per_game": {},
-            "shutdown_requested": shutdown_requested,
-            "status": "enriching",
-            "enrichment_progress": progress,
-            "enrichment_detail": {
-                "processed": batch_start + len(batch),
-                "total": total_to_enrich,
-                "fields_updated_total": fields_updated_total,
-            },
-        }
-        HEARTBEAT_FILE.write_text(json.dumps(heartbeat))
-        logger.info(
-            f"Enrichment progress: {batch_start + len(batch)}/{total_to_enrich} "
-            f"({progress}%) | {fields_updated_total} fields updated"
-        )
+        # Heartbeat every record (sequential so no batching)
+        processed = idx + 1
+        progress = int((processed / total_to_enrich) * 100)
+        if processed % 10 == 0 or updates:
+            heartbeat = {
+                "timestamp": datetime.now().isoformat(),
+                "pid": os.getpid(),
+                "total_records": conn.execute(
+                    "SELECT COUNT(*) FROM gameplay_records"
+                ).fetchone()[0],
+                "per_game": {},
+                "shutdown_requested": shutdown_requested,
+                "status": "enriching",
+                "enrichment_progress": progress,
+                "enrichment_detail": {
+                    "processed": processed,
+                    "total": total_to_enrich,
+                    "fields_updated_total": fields_updated_total,
+                },
+            }
+            HEARTBEAT_FILE.write_text(json.dumps(heartbeat))
+            logger.info(
+                f"Enrichment: {processed}/{total_to_enrich} ({progress}%) "
+                f"| {enriched_count} enriched | {fields_updated_total} fields updated"
+            )
 
     # Narration re-generation: independence violations AND generic fallback strings
     # (fallback was written when Ollama was unavailable during collection)
@@ -409,16 +471,15 @@ async def enrichment_pass(conn, deadline: datetime):
                OR gameplay_narration ILIKE '%working through game mechanics and pursuing progression goals%'
         """).fetchall()
         if violations:
-            logger.info(f"Enrichment: {len(violations)} narrations to regenerate")
-
-            async def _regen(rid: int, game_name: str, img_path: str, context: str):
+            logger.info(f"Enrichment: {len(violations)} narration independence violations")
+            for rid, narr in violations:
+                if datetime.now() >= cutoff or shutdown_requested:
+                    break
                 try:
-                    article_text = context if context.strip() else f"A {game_name} gameplay session."
-                    async with LLM_SEM:
-                        new_narr = await generate_narration(
-                            article_text, game_name,
-                            image_path=img_path, model=LLM_MODEL,
-                        )
+                    game_name = conn.execute(
+                        "SELECT video_game_name FROM gameplay_records WHERE id = ?", [rid]
+                    ).fetchone()[0]
+                    new_narr = await generate_narration(narr, game_name)
                     if new_narr and not IMAGE_REF_PATTERN.search(new_narr):
                         conn.execute(
                             "UPDATE gameplay_records SET gameplay_narration = ? WHERE id = ?",
@@ -451,6 +512,9 @@ async def enrichment_pass(conn, deadline: datetime):
                 bad.append(rid)
         if bad:
             logger.warning(f"Enrichment: {len(bad)} corrupt/undersized images: {bad}")
+
+    # Restore original exception handler
+    asyncio.get_event_loop().set_exception_handler(_original_handler)
 
     logger.info(
         f"Enrichment pass complete. "
@@ -609,6 +673,26 @@ async def main():
 
 def cli_main():
     """Sync entry point for console_scripts."""
+    asyncio.run(main())
+
+
+def enrich_cli_main():
+    """Sync entry point for enrichment-only mode with Ollama preflight check."""
+    import httpx
+
+    # Preflight: verify Ollama is reachable before doing any work.
+    try:
+        r = httpx.get("http://localhost:11434/v1/models", timeout=5)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"ERROR: Ollama is not reachable at http://localhost:11434 ({e})")
+        print("Start Ollama with: ollama serve")
+        print("Then warm up the model: ollama run gemma4:26b --keepalive 9h")
+        sys.exit(1)
+
+    # Force --enrich-only into argv if not already there.
+    if "--enrich-only" not in sys.argv:
+        sys.argv.insert(1, "--enrich-only")
     asyncio.run(main())
 
 

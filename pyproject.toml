@@ -41,6 +41,7 @@ notebooks = [
 [project.scripts]
 game-predictor-test = "game_predictor.cli.test_run:cli_main"
 game-predictor-run = "game_predictor.cli.run_production:cli_main"
+game-predictor-enrich = "game_predictor.cli.run_production:enrich_cli_main"
 game-predictor-preflight = "game_predictor.cli.pre_flight:main"
 game-predictor-sleeper = "game_predictor.cli.sleeper:main"
 game-nn-train = "game_nn.pipeline:run"

@@ -139,20 +139,19 @@ _NOT_NULL_COLS = [
 
 
 def _migration_applied(conn: duckdb.DuckDBPyConnection) -> bool:
-    """Check if the schema already allows NULLs on enrichable columns."""
+    """Check if the schema already allows NULLs on enrichable columns.
+
+    Uses DuckDB's information_schema to inspect whether player_name is NULLable.
+    """
     try:
-        # Try inserting a NULL into player_name in a rolled-back txn.
-        conn.execute("BEGIN TRANSACTION")
-        conn.execute(
-            "UPDATE gameplay_records SET player_name = NULL WHERE 1 = 0"
-        )
-        conn.execute("ROLLBACK")
-        return True
+        row = conn.execute(
+            "SELECT is_nullable FROM information_schema.columns "
+            "WHERE table_name = 'gameplay_records' AND column_name = 'player_name'"
+        ).fetchone()
+        if row is None:
+            return False
+        return row[0] == "YES"
     except Exception:
-        try:
-            conn.execute("ROLLBACK")
-        except Exception:
-            pass
         return False
 
 
@@ -227,16 +226,15 @@ def migrate_schema_for_enrichment(
         ("identifying_quotes", "identifying_quotes = ARRAY['N/A']::VARCHAR[]"),
     ]
     for col, where_clause in sentinel_updates:
-        result = conn.execute(
+        # Count before so we know how many were converted.
+        before = conn.execute(
+            f"SELECT count(*) FROM gameplay_records WHERE {where_clause}"
+        ).fetchone()[0]
+        conn.execute(
             f"UPDATE gameplay_records SET {col} = NULL WHERE {where_clause}"
         )
-        n = result.fetchone()[0] if result.description else 0
-        # DuckDB UPDATE doesn't return row count easily; query instead.
-        n = conn.execute(
-            f"SELECT count(*) FROM gameplay_records WHERE {col} IS NULL"
-        ).fetchone()[0]
-        counts[col] = n
-        logger.info("  %s: %d rows nullified", col, n)
+        counts[col] = before
+        logger.info("  %s: %d rows nullified", col, before)
 
     logger.info("Schema migration complete. Sentinel→NULL counts: %s", counts)
     return counts

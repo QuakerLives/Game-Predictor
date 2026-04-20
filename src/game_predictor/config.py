@@ -346,10 +346,10 @@ MAX_DELAY_SECONDS = 5.0
 # Enrichment Pass (see addendum)
 # ---------------------------------------------------------------------------
 
-ENRICHMENT_BATCH_SIZE = 5
-ENRICHMENT_RECORD_TIMEOUT = 120        # seconds per record
-ENRICHMENT_BROWSER_TIMEOUT = 60        # seconds for article/channel extraction
-ENRICHMENT_LLM_TIMEOUT = 30            # seconds for experience assessment
+ENRICHMENT_BATCH_SIZE = 1              # sequential: one record at a time
+ENRICHMENT_RECORD_TIMEOUT = 200        # Phase 1 + Phase 2 run in parallel; bound by slower path
+ENRICHMENT_BROWSER_TIMEOUT = 120       # 2 min for article/channel extraction
+ENRICHMENT_LLM_TIMEOUT = 60            # 1 min for experience assessment
 
 # Fields that can be enriched (allowlist for UPDATE queries)
 ENRICHABLE_FIELDS = frozenset({

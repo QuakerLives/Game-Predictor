@@ -31,7 +31,7 @@ def main():
         checks.append(("Playwright Chromium", False, str(e)))
 
     try:
-        conn = duckdb.connect("gameplay_data.duckdb")
+        conn = duckdb.connect("data/gameplay_data.duckdb")
         conn.execute("SELECT 1")
         conn.close()
         checks.append(("DuckDB writable", True, "OK"))

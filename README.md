@@ -1,77 +1,139 @@
 # Game Predictor
 
-Gemma 4 26B agentic web scraper & DuckDB pipeline for building a video game
-classification training dataset (CNN / NN / Transformer ensemble).
+Agentic data collection pipeline and multi-modal ensemble classifier for identifying
+video games from gameplay screenshots and text metadata.
 
-Targets **1 000 fully-populated records** (200 per game) across five titles:
-Stellaris, No Man's Sky, Apex Legends, Stardew Valley, and Skyrim.
+Classifies across five titles: **Apex Legends, No Man's Sky, Skyrim, Stardew Valley, Stellaris**
+
+---
+
+## Architecture
+
+```
+Gameplay Screenshot ──► CNN (EfficientNet-B0) ──────────────────┐
+                                                                 ├──► EnsembleCombiner ──► Prediction
+Gameplay Text       ──► Transformer (all-MiniLM-L6-v2 + FC) ───┘
+```
+
+The ensemble combines per-class softmax probabilities from each model using a
+learned weighting strategy (L-BFGS-B on validation cross-entropy).
+
+---
 
 ## Project Structure
 
 ```
 Game-Predictor/
-├── src/game_predictor/          # Installable Python package
-│   ├── config.py                # Game definitions, sentinels, concurrency limits
-│   ├── models.py                # Pydantic data models (ImageResult, ArticleData, …)
-│   ├── prompts.py               # Gemma 4 prompt templates
-│   ├── agent.py                 # Per-game orchestrator (Google → YouTube → supplementary)
-│   ├── tools/                   # Scraping & processing tools
-│   │   ├── search.py            # Google/Bing Images + YouTube search
-│   │   ├── extract.py           # Article text extraction via Gemma 4
-│   │   ├── screenshot.py        # YouTube screenshot capture + channel info
-│   │   ├── download.py          # Async image downloader with validation
-│   │   ├── narrate.py           # Semantically-independent narration generation
-│   │   ├── assess.py            # Multimodal experience assessment (Ollama native)
-│   │   └── database.py          # DuckDB schema, insertion (Iron Rule gates), validation
-│   └── cli/                     # Command-line entry points
-│       ├── test_run.py          # Trial run — 5 records/game, 25 total
-│       ├── run_production.py    # Production — 200 records/game, 1 000 total
-│       ├── pre_flight.py        # Pre-flight system checks
-│       └── sleeper.py           # Gemma 4-powered watchdog for overnight autonomy
+├── src/
+│   ├── game_predictor/          # Agentic scraper (data collection)
+│   │   ├── agent.py             # Per-game LangGraph orchestrator
+│   │   ├── tools/               # search, screenshot, narrate, assess, database
+│   │   ├── prompts.py           # Gemma 4 prompt templates
+│   │   └── cli/                 # test_run, run_production, pre_flight, sleeper
+│   │
+│   ├── game_cnn/                # Image classifier
+│   │   ├── data.py              # Blur detection, pHash dedup, stratified split, DataLoaders
+│   │   ├── model.py             # EfficientNet-B0 with replaced classifier head
+│   │   ├── pipeline.py          # 2-phase training (warm-up + fine-tune), early stopping
+│   │   └── inspect.py           # Preprocessing report (blurry/duplicate CSVs)
+│   │
+│   ├── game_transformer/        # Text embedding classifier
+│   │   ├── data.py              # DB → sanitize → SentenceTransformer embed → split
+│   │   └── pipeline.py          # Trains FC classifier on fixed embeddings
+│   │
+│   ├── game_nn/                 # Steam metadata classifier
+│   │   ├── data.py              # Impute, standardize, PCA, KMeans cluster feature
+│   │   ├── model.py             # FC neural network (GameClassifier)
+│   │   └── pipeline.py          # Training loop with early stopping
+│   │
+│   └── ensemble/
+│       ├── combiner.py          # EnsembleCombiner (average / weighted / learned)
+│       └── run.py               # Loads saved model outputs, reports combined accuracy
+│
+├── data/                        # DuckDB database + images (gitignored)
+├── models/                      # Saved model weights + test outputs (gitignored)
 ├── scripts/                     # Standalone utility scripts
-│   ├── extract_from_steam.py    # Steam API → DuckDB helper
-│   └── test.py                  # Polars schema prototype
-├── tests/                       # Test suite (future)
 ├── docs/
-│   └── design.md                # Full design document (§1–§18)
-├── pyproject.toml               # Package metadata, deps, console scripts
+│   └── design.md                # Full design document
+├── pyproject.toml
 └── .gitignore
 ```
 
-## Quick Start
+---
+
+## Setup
 
 ```bash
-# 1. Install dependencies
-uv sync
+# Install base + all ML extras
+uv sync --extra cnn --extra transformer
 
-# 2. Install Playwright browser
+# Install Playwright browser (for data collection only)
 uv run playwright install chromium
 
-# 3. Ensure Ollama is serving Gemma 4
+# Ensure Ollama is serving Gemma 4 (for data collection only)
 ollama serve &
 ollama pull gemma4:26b
+```
 
-# 4. Pre-flight check
+---
+
+## Training the Models
+
+Run in order — each step produces files consumed by the next.
+
+```bash
+# 1. Train the image CNN (saves models/cnn.pt + models/shared_split.npz)
+uv run game-cnn-train
+
+# 2. Train the text transformer (uses shared_split.npz to align test sets)
+uv run game-transformer-train
+
+# 3. Evaluate the ensemble
+uv run game-ensemble
+```
+
+Model weights and test outputs are saved to `models/` (gitignored — retrain locally).
+
+---
+
+## Data Collection
+
+```bash
+# Pre-flight check (LLM, Playwright, disk, memory)
 uv run game-predictor-preflight
 
-# 5. Trial run (always run first — validates every tool)
+# Trial run: 5 records × 5 games (always run first)
 uv run game-predictor-test --llm-base-url http://localhost:11434/v1
 
-# 6. Production run (overnight, via sleeper watchdog)
+# Production run (overnight via watchdog)
 caffeinate -s uv run game-predictor-sleeper --llm-base-url http://localhost:11434/v1
 ```
+
+---
 
 ## Console Scripts
 
 | Command | Description |
 |---|---|
-| `game-predictor-preflight` | Checks disk, LLM, Playwright, memory, internet |
-| `game-predictor-test` | Trial run: 5 records × 5 games = 25 total |
-| `game-predictor-run` | Production: 200 records × 5 games = 1 000 total |
-| `game-predictor-sleeper` | Watchdog: spawns production, monitors, auto-restarts |
+| `game-cnn-train` | Train EfficientNet-B0 image classifier |
+| `game-transformer-train` | Train text embedding classifier |
+| `game-ensemble` | Evaluate ensemble on shared test set |
+| `game-nn-train` | Train Steam metadata classifier |
+| `game-predictor-preflight` | System checks before data collection |
+| `game-predictor-test` | Trial scrape: 5 records × 5 games |
+| `game-predictor-run` | Production scrape: 200 records × 5 games |
+| `game-predictor-sleeper` | Overnight watchdog for production run |
 
-## Design
+---
 
-See [`docs/design.md`](docs/design.md) for the full 2 900-line specification covering
-schema, tool definitions, prompt templates, time budget, error handling, and the
-sleeper agent architecture.
+## Data
+
+`data/gameplay_data.duckdb` — ~1,002 records (~200 per game)
+
+Key columns: `id`, `video_game_name`, `image_path`, `gameplay_narration`,
+`channel_description`, `identifying_quotes`, `source_url`
+
+Images live at `data/images/<game_slug>/<id>.png` (gitignored).
+
+See [`docs/design.md`](docs/design.md) for the full specification covering schema,
+tool definitions, prompt templates, and the scraper architecture.

@@ -138,7 +138,7 @@ def ensemble_evaluate(
 
 
 def run(
-    db_path: str | Path = "steam_data.duckdb",
+    db_path: str | Path = "data/steam_data.duckdb",
     n_ensemble: int = 3,
     epochs: int = 300,
     lr: float = 1e-2,

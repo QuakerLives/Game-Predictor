@@ -79,7 +79,7 @@ ORDER BY g.name, ra.ach_name
 
 
 def extract_features(
-    db_path: str | Path = "steam_data.duckdb",
+    db_path: str | Path = "data/steam_data.duckdb",
 ) -> tuple[np.ndarray, np.ndarray, list[str], list[str]]:
     """Build feature matrix X and integer label vector y from DuckDB.
 
@@ -204,7 +204,7 @@ def resample_training(
 
 
 def build_dataset(
-    db_path: str | Path = "steam_data.duckdb",
+    db_path: str | Path = "data/steam_data.duckdb",
     pca_components: int | None = None,
     n_clusters: int = 5,
     seed: int = 42,

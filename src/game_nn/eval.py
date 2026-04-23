@@ -137,7 +137,7 @@ def _confusion_block(
     return lines
 
 
-def run_eval(db_path: str | Path = "steam_data.duckdb") -> None:
+def run_eval(db_path: str | Path = "data/steam_data.duckdb") -> None:
     t0 = time.perf_counter()
 
     # ── 0. Banner ────────────────────────────────────────────────────
@@ -402,6 +402,6 @@ if __name__ == "__main__":
     import argparse
 
     p = argparse.ArgumentParser(description="Game-NN evaluation report")
-    p.add_argument("--db", default="steam_data.duckdb", help="Path to DuckDB file")
+    p.add_argument("--db", default="data/steam_data.duckdb", help="Path to DuckDB file")
     args = p.parse_args()
     run_eval(args.db)

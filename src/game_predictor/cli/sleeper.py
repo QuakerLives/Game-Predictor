@@ -23,7 +23,7 @@ import httpx
 
 HEARTBEAT_FILE = Path("heartbeat.json")
 PROD_LOG_FILE = Path("production_run.log")
-DB_PATH = "gameplay_data.duckdb"
+DB_PATH = "data/gameplay_data.duckdb"
 OLLAMA_HEALTH_URL = "http://localhost:11434/v1/models"
 DEFAULT_HANG_TIMEOUT = 900
 DEFAULT_MAX_RESTARTS = 8

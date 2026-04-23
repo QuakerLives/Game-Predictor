@@ -11,8 +11,8 @@ from pathlib import Path
 # Database & Image Paths
 # ---------------------------------------------------------------------------
 
-DB_PATH = "gameplay_data.duckdb"
-IMAGE_DIR = Path("images")
+DB_PATH = "data/gameplay_data.duckdb"
+IMAGE_DIR = Path("data/images")
 
 GAME_SLUGS = ["stellaris", "no_mans_sky", "apex_legends", "stardew_valley", "skyrim"]
 

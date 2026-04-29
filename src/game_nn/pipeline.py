@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from .data import SplitData, build_dataset
+from .data import SplitData, build_dataset, build_dataset_from_gameplay
 from .model import GameClassifier
 
 
@@ -135,6 +135,75 @@ def ensemble_evaluate(
             per_class[name] = (preds[mask] == y[mask]).float().mean().item()
 
     return {"accuracy": acc, "per_class": per_class}
+
+
+def run_on_gameplay_data(
+    gameplay_db_path: str | Path = "data/gameplay_data.duckdb",
+    hidden_dims: tuple[int, ...] = (128, 64, 32),
+    dropout: float = 0.3,
+    lr: float = 1e-3,
+    epochs: int = 300,
+    batch_size: int = 32,
+) -> None:
+    """Train NN on gameplay numerical features and save outputs for ensemble.
+
+    Loads models/shared_split.npz (written by game_cnn) so the test set aligns
+    with the CNN and Transformer — required for the ensemble to combine them.
+
+    Run order:
+        1. python -m game_cnn          → trains CNN, saves shared_split.npz
+        2. python -m game_transformer  → trains Transformer on same test records
+        3. python -m game_nn --gameplay → trains NN on same test records
+        4. python -m ensemble.run      → combines all three
+    """
+    print("=" * 60)
+    print("  Game-NN (gameplay)  ·  Numerical Feature Classifier")
+    print("=" * 60)
+
+    shared_split_path = Path("models/shared_split.npz")
+    test_record_ids = None
+    if shared_split_path.exists():
+        split_data = np.load(shared_split_path, allow_pickle=True)
+        test_record_ids = list(split_data["test_record_ids"].astype(int))
+        print(f"[nn-gameplay] using shared split ({len(test_record_ids)} test records from CNN)")
+    else:
+        print("[nn-gameplay] no shared split found — using independent split")
+        print("              (run game_cnn first to align test sets for ensemble)")
+
+    data = build_dataset_from_gameplay(gameplay_db_path, test_record_ids=test_record_ids)
+
+    model, info = train_single_model(
+        data,
+        hidden_dims=hidden_dims,
+        dropout=dropout,
+        lr=lr,
+        epochs=epochs,
+        batch_size=batch_size,
+    )
+    result = evaluate(model, data)
+    print(f"\n  val_acc={info['best_val_acc']:.4f}  test_acc={result['accuracy']:.4f}")
+    for name, acc in result["per_class"].items():
+        print(f"    {name:30s} {acc:.4f}")
+
+    save_dir = Path("models")
+    save_dir.mkdir(exist_ok=True)
+
+    torch.save(
+        {"state_dict": model.state_dict(), "n_features": data.n_features,
+         "n_classes": data.n_classes, "label_names": data.label_names},
+        save_dir / "nn.pt",
+    )
+    np.savez(
+        save_dir / "nn_test.npz",
+        probs=result["probs"],
+        y_true=data.y_test,
+        label_names=np.array(data.label_names),
+    )
+    print(f"\n  Saved → models/nn.pt  |  models/nn_test.npz")
+
+    print("\n" + "=" * 60)
+    print("  Pipeline complete. Run 'python -m ensemble.run' to combine all models.")
+    print("=" * 60)
 
 
 def run(

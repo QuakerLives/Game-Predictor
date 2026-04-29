@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.impute import SimpleImputer
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
@@ -41,6 +42,28 @@ class SplitData:
         self.n_features = self.X_train.shape[1]
         self.n_classes = len(self.label_names)
 
+
+_EXP_LEVEL_MAP: dict[str, float] = {
+    "Poor": 0.0, "Fair": 1.0, "Good": 2.0, "Excellent": 3.0, "Superior": 4.0,
+}
+
+_GAMEPLAY_QUERY = """
+SELECT
+    id,
+    video_game_name,
+    experience_level,
+    source_type,
+    CASE WHEN player_name          IS NOT NULL THEN 1.0 ELSE 0.0 END AS has_player_name,
+    CASE WHEN gameplay_timestamp   IS NOT NULL THEN 1.0 ELSE 0.0 END AS has_timestamp,
+    CASE WHEN channel_description  IS NOT NULL THEN 1.0 ELSE 0.0 END AS has_channel_desc,
+    LENGTH(gameplay_narration) AS narration_len,
+    COALESCE(gameplay_narration, '')              AS narration_text
+FROM gameplay_records
+ORDER BY id
+"""
+
+# gameplay_level (97% NULL) and total_playtime (95% NULL) were removed — after median
+# imputation they become constants with zero variance and add no signal.
 
 _FEATURE_QUERY = """
 WITH ranked_ach AS (
@@ -241,6 +264,125 @@ def build_dataset(
     pre_resample = len(y_tr)
     X_tr, y_tr = resample_training(X_tr, y_tr, seed=seed)
     print(f"[data] resample  {pre_resample} → {len(y_tr)} training samples")
+
+    return SplitData(
+        X_train=X_tr, y_train=y_tr,
+        X_val=X_va, y_val=y_va,
+        X_test=X_te, y_test=y_te,
+        label_names=label_names,
+        feature_names=feature_names,
+    )
+
+
+def build_dataset_from_gameplay(
+    db_path: str | Path = "data/gameplay_data.duckdb",
+    test_record_ids: list[int] | None = None,
+    tfidf_max_features: int = 100,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+    seed: int = 42,
+) -> SplitData:
+    """Build a feature matrix from gameplay_records for the ensemble NN.
+
+    Features (6 numerical + up to tfidf_max_features TF-IDF terms):
+      experience_level (ordinal 0-4), is_youtube (binary),
+      has_player_name, has_timestamp, has_channel_desc (all binary),
+      narration_len (continuous),
+      + TF-IDF top-N terms from gameplay_narration text
+
+    TF-IDF is fitted on the training split only (no leakage). Game-specific
+    vocabulary in the narrations ("fleet", "empire" → Stellaris; "harvest",
+    "farm" → Stardew Valley) gives the model genuine signal to learn from.
+
+    gameplay_level and total_playtime were dropped (97%/95% NULL → zero-variance
+    constants after median imputation, no signal).
+
+    When *test_record_ids* is provided (from models/shared_split.npz), those
+    records form the test set so the NN aligns with the CNN and Transformer.
+    """
+    con = duckdb.connect(str(db_path), read_only=True)
+    rows = con.execute(_GAMEPLAY_QUERY).fetchall()
+    con.close()
+
+    label_names = sorted({r[1] for r in rows})
+    label_to_idx = {name: i for i, name in enumerate(label_names)}
+
+    record_ids = np.array([r[0] for r in rows], dtype=np.int64)
+    y = np.array([label_to_idx[r[1]] for r in rows], dtype=np.int64)
+
+    # _GAMEPLAY_QUERY columns: id, video_game_name, experience_level,
+    #   source_type, has_player_name, has_timestamp, has_channel_desc,
+    #   narration_len, narration_text
+    X_num_rows: list[list[float]] = []
+    texts: list[str] = []
+    for r in rows:
+        exp_enc = _EXP_LEVEL_MAP.get(r[2], np.nan)
+        is_yt = 1.0 if r[3] == "youtube" else 0.0
+        X_num_rows.append([exp_enc, is_yt, float(r[4]), float(r[5]), float(r[6]), float(r[7] or 0)])
+        texts.append(r[8])
+
+    X_num = np.array(X_num_rows, dtype=np.float64)
+    texts_arr = np.array(texts, dtype=object)
+    num_feature_names = [
+        "experience_level", "is_youtube",
+        "has_player_name", "has_timestamp", "has_channel_desc", "narration_len",
+    ]
+
+    print(f"[nn-gameplay] {X_num.shape[0]} records, {len(label_names)} classes")
+    nan_counts = {num_feature_names[i]: int(np.isnan(X_num[:, i]).sum()) for i in range(X_num.shape[1])}
+    print(f"[nn-gameplay] NaN counts: {nan_counts}")
+
+    # Split — shared or independent; carry texts through the same split
+    if test_record_ids is not None:
+        id_to_pos = {int(rid): i for i, rid in enumerate(record_ids.tolist())}
+        te_indices = [id_to_pos[rid] for rid in test_record_ids if rid in id_to_pos]
+        te_set = set(te_indices)
+        tr_val_indices = [i for i in range(len(record_ids)) if i not in te_set]
+
+        X_te, y_te = X_num[te_indices], y[te_indices]
+        texts_te = texts_arr[te_indices]
+        X_rest, y_rest = X_num[tr_val_indices], y[tr_val_indices]
+        texts_rest = texts_arr[tr_val_indices]
+
+        adjusted_val = val_ratio / (1.0 - test_ratio)
+        X_tr, X_va, y_tr, y_va, texts_tr, texts_va = train_test_split(
+            X_rest, y_rest, texts_rest, test_size=adjusted_val, stratify=y_rest, random_state=seed,
+        )
+        print(f"[nn-gameplay] shared split  train={len(y_tr)}  val={len(y_va)}  test={len(y_te)}")
+    else:
+        holdout = val_ratio + test_ratio
+        X_tr, X_tmp, y_tr, y_tmp, texts_tr, texts_tmp = train_test_split(
+            X_num, y, texts_arr, test_size=holdout, stratify=y, random_state=seed,
+        )
+        rel_test = test_ratio / holdout
+        X_va, X_te, y_va, y_te, texts_va, texts_te = train_test_split(
+            X_tmp, y_tmp, texts_tmp, test_size=rel_test, stratify=y_tmp, random_state=seed,
+        )
+        print(f"[nn-gameplay] split  train={len(y_tr)}  val={len(y_va)}  test={len(y_te)}")
+
+    # Impute NaNs on numerical features (train-fit only)
+    X_tr, X_va, X_te, _ = impute(X_tr, X_va, X_te)
+
+    # TF-IDF on narration text (train-fit only — no leakage)
+    tfidf = TfidfVectorizer(max_features=tfidf_max_features, stop_words="english", min_df=2)
+    Xtf_tr = tfidf.fit_transform(texts_tr.tolist()).toarray()
+    Xtf_va = tfidf.transform(texts_va.tolist()).toarray()
+    Xtf_te = tfidf.transform(texts_te.tolist()).toarray()
+    tfidf_names = tfidf.get_feature_names_out().tolist()
+    print(f"[nn-gameplay] TF-IDF vocabulary size: {len(tfidf_names)}")
+
+    X_tr = np.hstack([X_tr, Xtf_tr])
+    X_va = np.hstack([X_va, Xtf_va])
+    X_te = np.hstack([X_te, Xtf_te])
+    feature_names = num_feature_names + tfidf_names
+
+    # Standardize the full feature matrix (train-fit only)
+    X_tr, X_va, X_te, _ = standardize(X_tr, X_va, X_te)
+
+    # Oversample minority classes in training set only
+    pre = len(y_tr)
+    X_tr, y_tr = resample_training(X_tr, y_tr, seed=seed)
+    print(f"[nn-gameplay] resample  {pre} → {len(y_tr)} training samples")
 
     return SplitData(
         X_train=X_tr, y_train=y_tr,

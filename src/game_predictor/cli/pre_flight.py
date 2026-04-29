@@ -7,11 +7,13 @@ from pathlib import Path
 
 import duckdb
 
+from game_predictor.config import LLM_MODEL
+
 
 def main():
     checks = []
 
-    free_gb = shutil.disk_usage("/").free / (1024**3)
+    free_gb = shutil.disk_usage(".").free / (1024**3)
     checks.append(("Disk space >= 5 GB", free_gb >= 5, f"{free_gb:.1f} GB"))
 
     try:
@@ -39,26 +41,32 @@ def main():
         checks.append(("DuckDB writable", False, str(e)))
 
     try:
-        mem_bytes = int(
-            subprocess.run(
-                ["sysctl", "-n", "hw.memsize"],
-                capture_output=True, text=True, timeout=5,
-            ).stdout.strip()
+        result = subprocess.run(
+            ["wmic", "computersystem", "get", "TotalPhysicalMemory", "/value"],
+            capture_output=True, text=True, timeout=5,
         )
-        mem_gb = mem_bytes / (1024**3)
-        checks.append(("Unified memory >= 32 GB", mem_gb >= 32, f"{mem_gb:.0f} GB"))
+        mem_gb = None
+        for line in result.stdout.splitlines():
+            if "TotalPhysicalMemory=" in line:
+                mem_bytes = int(line.split("=")[1].strip())
+                mem_gb = mem_bytes / (1024 ** 3)
+                break
+        if mem_gb is not None:
+            checks.append(("RAM >= 28 GB", mem_gb >= 28, f"{mem_gb:.0f} GB"))
+        else:
+            checks.append(("RAM check", False, "Could not read memory info"))
     except Exception as e:
-        checks.append(("Unified memory", False, str(e)))
+        checks.append(("RAM check", False, str(e)))
 
     try:
         result = subprocess.run(
             ["ollama", "list"], capture_output=True, text=True, timeout=10,
         )
-        has_model = "gemma4:26b" in result.stdout
+        has_model = LLM_MODEL in result.stdout
         checks.append((
-            "Ollama gemma4:26b pulled",
+            f"Ollama {LLM_MODEL} pulled",
             has_model,
-            "found" if has_model else "NOT FOUND -- run: ollama pull gemma4:26b",
+            "found" if has_model else f"NOT FOUND -- run: ollama pull {LLM_MODEL}",
         ))
     except Exception as e:
         checks.append(("Ollama installed", False, str(e)))

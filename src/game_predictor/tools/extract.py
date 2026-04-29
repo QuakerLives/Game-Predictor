@@ -8,13 +8,11 @@ import json
 import logging
 from datetime import datetime
 
-from langchain_openai import ChatOpenAI
+import httpx
 
 from game_predictor.config import (
-    DEFAULT_LLM_BASE_URL,
-    LLM_MAX_TOKENS,
     LLM_MODEL,
-    LLM_TEMPERATURE,
+    OLLAMA_NATIVE_URL,
     SENTINEL_INT,
     SENTINEL_QUOTES,
     SENTINEL_STR,
@@ -25,15 +23,9 @@ from game_predictor.prompts import ARTICLE_EXTRACTION_SYSTEM, ARTICLE_EXTRACTION
 
 logger = logging.getLogger(__name__)
 
-# ── Module-level LLM singleton ────────────────────────────────────────────
-
-_llm = ChatOpenAI(
-    base_url=DEFAULT_LLM_BASE_URL,
-    api_key="not-needed",
-    model=LLM_MODEL,
-    temperature=LLM_TEMPERATURE,
-    max_tokens=LLM_MAX_TOKENS,
-)
+_GENERATE_ENDPOINT = f"{OLLAMA_NATIVE_URL}/api/generate"
+_REQUEST_TIMEOUT = 90.0
+_NUM_PREDICT = 512
 
 STRIP_SELECTORS = [
     "nav", "footer", "header", "aside",
@@ -97,23 +89,44 @@ async def click_article_and_extract(
         logger.error("Article extraction failed for %s: %s", source_url, exc)
         return _default_article()
     finally:
-        await browser.close()
-        await pw.stop()
+        from game_predictor.tools.search import _close_browser
+        await _close_browser(browser, pw)
 
 
 async def _llm_extract(article_text: str, game_name: str) -> ArticleData:
-    """Send article text to Gemma 4 and parse the JSON response."""
+    """Send article text to Ollama /api/generate and parse the JSON response."""
     user_prompt = ARTICLE_EXTRACTION_USER.format(
         game_name=game_name, article_text=article_text
     )
+    prompt = f"{ARTICLE_EXTRACTION_SYSTEM}\n\n{user_prompt}"
+
+    payload = {
+        "model": LLM_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"num_predict": _NUM_PREDICT},
+    }
+
+    def _sync() -> str | None:
+        try:
+            with httpx.Client() as client:
+                resp = client.post(_GENERATE_ENDPOINT, json=payload, timeout=_REQUEST_TIMEOUT)
+                resp.raise_for_status()
+                return resp.json().get("response", "").strip()
+        except Exception:
+            logger.exception("Ollama extraction call failed")
+            return None
 
     try:
-        response = await _llm.ainvoke([
-            {"role": "system", "content": ARTICLE_EXTRACTION_SYSTEM},
-            {"role": "user", "content": user_prompt},
-        ])
-        raw = response.content.strip()
+        raw = await asyncio.to_thread(_sync)
+    except Exception:
+        logger.exception("to_thread failed in _llm_extract")
+        return _default_article()
 
+    if not raw:
+        return _default_article()
+
+    try:
         # Strip markdown fences if the model wraps its output
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[-1]
@@ -241,8 +254,8 @@ async def extract_author_profile(
         logger.debug("Author profile extraction failed: %s", exc)
         return sentinel
     finally:
-        await browser.close()
-        await pw.stop()
+        from game_predictor.tools.search import _close_browser
+        await _close_browser(browser, pw)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────

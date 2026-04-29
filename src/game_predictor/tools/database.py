@@ -73,11 +73,10 @@ async def write_to_database(
       • image_path must be a non-empty string.
       • gameplay_narration must not be empty or the sentinel value.
     """
-    assert record.image_path, "Iron Rule violated: image_path is empty"
-    assert (
-        record.gameplay_narration
-        and record.gameplay_narration != SENTINEL_STR
-    ), "Iron Rule violated: gameplay_narration is sentinel or empty"
+    if not record.image_path:
+        raise ValueError("Iron Rule violated: image_path is empty")
+    if not record.gameplay_narration or record.gameplay_narration == SENTINEL_STR:
+        raise ValueError("Iron Rule violated: gameplay_narration is sentinel or empty")
 
     result = conn.execute(
         """
@@ -302,7 +301,7 @@ def validate_database(conn: duckdb.DuckDBPyConnection) -> dict:
     # --- total count ---
     total = conn.execute("SELECT count(*) FROM gameplay_records;").fetchone()[0]
     report["total_records"] = total
-    report["target_met"] = total >= 1000
+    report["target_met"] = total >= 10000
 
     # --- per-game distribution ---
     rows = conn.execute(

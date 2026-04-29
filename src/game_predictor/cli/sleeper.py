@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-SLEEPER AGENT -- Gemma 4-powered watchdog for autonomous overnight runs.
+SLEEPER AGENT -- Autonomous watchdog for overnight runs.
 TOP-LEVEL ENTRY POINT. Run this, then go to sleep.
 
 Usage:
-    python sleeper.py [--llm-base-url http://localhost:11434/v1]
-                      [--max-restarts 5] [--hang-timeout 600]
+    uv run game-predictor-sleeper [--llm-base-url http://localhost:11434/v1]
+                                  [--max-restarts 5] [--hang-timeout 600]
 """
 
 import argparse
@@ -14,6 +14,7 @@ import logging
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -21,12 +22,15 @@ from pathlib import Path
 import duckdb
 import httpx
 
+from game_predictor.config import LLM_MODEL
+
 HEARTBEAT_FILE = Path("heartbeat.json")
 PROD_LOG_FILE = Path("production_run.log")
 DB_PATH = "data/gameplay_data.duckdb"
 OLLAMA_HEALTH_URL = "http://localhost:11434/v1/models"
 DEFAULT_HANG_TIMEOUT = 900
 DEFAULT_MAX_RESTARTS = 8
+TOTAL_TARGET = 10000
 ALLOWED_ACTIONS = {
     "restart_production",
     "restart_ollama",
@@ -85,7 +89,7 @@ def check_ollama_health() -> bool:
         return False
 
 
-def diagnose_with_gemma4(
+def diagnose(
     exit_code, heartbeat, log_tail, db_state, ollama_ok, restart_count, url
 ) -> dict:
     prompt = f"""You are a systems diagnostician for a Python web-scraping pipeline.
@@ -118,7 +122,7 @@ Return JSON only: {{"diagnosis": "...", "action": "action_name", "reasoning": ".
         r = httpx.post(
             f"{url}/chat/completions",
             json={
-                "model": "gemma4:26b",
+                "model": LLM_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 4096,
                 "temperature": 0.2,
@@ -127,7 +131,16 @@ Return JSON only: {{"diagnosis": "...", "action": "action_name", "reasoning": ".
         )
         text = r.json()["choices"][0]["message"]["content"]
         text = text.replace("```json", "").replace("```", "").strip()
-        result = json.loads(text)
+        try:
+            result = json.loads(text)
+        except json.JSONDecodeError:
+            text_lower = text.lower()
+            action = "restart_production"
+            for a in ALLOWED_ACTIONS:
+                if a.replace("_", " ") in text_lower or a in text_lower:
+                    action = a
+                    break
+            result = {"diagnosis": text[:200], "action": action, "reasoning": "parsed from malformed JSON"}
         if result.get("action") not in ALLOWED_ACTIONS:
             result["action"] = "restart_production"
         return result
@@ -154,7 +167,14 @@ def execute_action(action: str, llm_url: str) -> bool:
 
     if action == "restart_ollama":
         try:
-            subprocess.run(["pkill", "-f", "ollama"], timeout=10)
+            # Windows: taskkill; Unix fallback: pkill
+            if sys.platform == "win32":
+                subprocess.run(
+                    ["taskkill", "/F", "/IM", "ollama.exe"],
+                    timeout=10, capture_output=True,
+                )
+            else:
+                subprocess.run(["pkill", "-f", "ollama"], timeout=10, capture_output=True)
             time.sleep(3)
             subprocess.Popen(
                 ["ollama", "serve"],
@@ -163,7 +183,7 @@ def execute_action(action: str, llm_url: str) -> bool:
             )
             time.sleep(5)
             subprocess.run(
-                ["ollama", "run", "gemma4:26b", "--keepalive", "9h"],
+                ["ollama", "run", LLM_MODEL, "--keepalive", "12h"],
                 input="hello",
                 capture_output=True,
                 text=True,
@@ -180,8 +200,8 @@ def execute_action(action: str, llm_url: str) -> bool:
 
     if action == "restart_browser":
         import shutil
-
-        for d in Path("/tmp").glob("playwright-*"):
+        tmp = Path(tempfile.gettempdir())
+        for d in tmp.glob("playwright-*"):
             shutil.rmtree(d, ignore_errors=True)
         return True
 
@@ -285,10 +305,8 @@ def monitor_enrichment(proc, deadline, hang_timeout):
                         f"({pct}%) | {fields} fields updated"
                     )
             elif status in ("enrichment_complete", "completed"):
-                # Process hasn't exited yet but status says done — wait for clean exit
                 pass
             else:
-                # Still in production mode heartbeat — treat total_records as progress
                 cur = hb.get("total_records", -1)
                 if cur > last_enrichment_pct:
                     last_enrichment_pct = cur
@@ -322,7 +340,7 @@ def main():
     args = ap.parse_args()
 
     t0 = datetime.now()
-    deadline = t0 + timedelta(hours=9)
+    deadline = t0 + timedelta(hours=12)
     restarts = 0
 
     logger.info("=" * 70)
@@ -350,10 +368,10 @@ def main():
             if exit_code is not None:
                 if exit_code == 0:
                     db = read_db_state()
-                    if db["total"] >= 1000:
+                    if db["total"] >= TOTAL_TARGET:
                         logger.info(f"TARGET MET ({db['total']})")
                         return
-                    logger.warning(f"Clean exit, {db['total']}/1000. Restarting.")
+                    logger.warning(f"Clean exit, {db['total']}/{TOTAL_TARGET}. Restarting.")
                 else:
                     logger.error(f"Crash (exit {exit_code})")
                 break
@@ -370,7 +388,7 @@ def main():
                     exit_code = -1
                     break
                 if int(time.time()) % 120 < 15:
-                    logger.info(f"OK | {cur}/1000")
+                    logger.info(f"OK | {cur}/{TOTAL_TARGET}")
             elif (datetime.now() - last_progress).total_seconds() > args.hang_timeout:
                 logger.error("No heartbeat")
                 kill_child(proc)
@@ -387,7 +405,7 @@ def main():
         db = read_db_state()
         ollama_ok = check_ollama_health()
         logger.info(f"Ollama={ollama_ok} DB={db.get('total', '?')}")
-        dx = diagnose_with_gemma4(
+        dx = diagnose(
             exit_code, hb, log, db, ollama_ok, restarts, args.llm_base_url
         )
         logger.info(f"Dx: {dx.get('diagnosis')} -> {dx.get('action')}")
@@ -402,7 +420,7 @@ def main():
     db_state = read_db_state()
     time_left = deadline - datetime.now()
 
-    if db_state.get("total", 0) >= 1000 and time_left > timedelta(minutes=30):
+    if db_state.get("total", 0) >= TOTAL_TARGET and time_left > timedelta(minutes=30):
         remaining_hours = time_left.total_seconds() / 3600
         logger.info("=" * 70)
         logger.info(
@@ -418,12 +436,11 @@ def main():
         if enrich_exit != 0:
             logger.warning(
                 f"Enrichment exited with code {enrich_exit}. "
-                f"May require manual re-run: "
-                f"python -m game_predictor.cli.run_production --enrich-only"
+                f"Re-run manually: uv run game-predictor-run --enrich-only"
             )
-    elif db_state.get("total", 0) < 1000:
+    elif db_state.get("total", 0) < TOTAL_TARGET:
         logger.warning(
-            f"Production target not met ({db_state.get('total', 0)}/1000) "
+            f"Production target not met ({db_state.get('total', 0)}/{TOTAL_TARGET}) "
             f"— skipping enrichment phase."
         )
     else:
@@ -432,10 +449,10 @@ def main():
     db_final = read_db_state()
     logger.info("=" * 70)
     logger.info(
-        f"SESSION DONE | restarts={restarts} | records={db_final.get('total', 0)}/1000 | "
+        f"SESSION DONE | restarts={restarts} | records={db_final.get('total', 0)}/{TOTAL_TARGET} | "
         f"elapsed={datetime.now() - t0}"
     )
-    status = "MET" if db_final.get("total", 0) >= 1000 else "NOT MET"
+    status = "MET" if db_final.get("total", 0) >= TOTAL_TARGET else "NOT MET"
     logger.info(status)
     logger.info("=" * 70)
 

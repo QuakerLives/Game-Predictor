@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-PRODUCTION RUN -- 200 records per game, 1000 total.
-9-hour execution window with quality enrichment pass.
+PRODUCTION RUN -- 2000 records per game, 10000 total.
+12-hour execution window with quality enrichment pass.
 
 Usage:
     python run_production.py [--llm-base-url http://localhost:11434/v1]
@@ -25,7 +25,7 @@ from PIL import Image
 from game_predictor.config import (
     GAMES, SENTINEL_STR, SENTINEL_INT, SENTINEL_TIMESTAMP, SENTINEL_QUAL,
     SENTINEL_QUOTES, IMAGE_REF_PATTERN, DB_PATH, IMAGE_DIR,
-    LLM_CONCURRENCY, BROWSER_CONCURRENCY,
+    LLM_CONCURRENCY, BROWSER_CONCURRENCY, LLM_MODEL, ENRICHMENT_LLM_MODEL,
     ENRICHMENT_BATCH_SIZE, ENRICHMENT_RECORD_TIMEOUT,
     ENRICHMENT_BROWSER_TIMEOUT, ENRICHMENT_LLM_TIMEOUT,
 )
@@ -45,7 +45,7 @@ from game_predictor.agent import process_game
 from game_predictor import agent as agent_module
 
 PROD_LOG_FILE = "production_run.log"
-DEADLINE_HOURS = 9
+DEADLINE_HOURS = 12
 HEARTBEAT_FILE = Path("heartbeat.json")
 HEARTBEAT_INTERVAL = 30
 
@@ -162,7 +162,7 @@ async def _enrich_google_record(
         try:
             async with llm_sem:
                 exp = await asyncio.wait_for(
-                    assess_experience_level(image_path, context_text, game_name),
+                    assess_experience_level(image_path, context_text, game_name, model=ENRICHMENT_LLM_MODEL),
                     timeout=ENRICHMENT_LLM_TIMEOUT,
                 )
             if exp and exp != SENTINEL_QUAL:
@@ -244,7 +244,7 @@ async def _enrich_youtube_record(
         try:
             async with llm_sem:
                 exp = await asyncio.wait_for(
-                    assess_experience_level(image_path, context_text, game_name),
+                    assess_experience_level(image_path, context_text, game_name, model=ENRICHMENT_LLM_MODEL),
                     timeout=ENRICHMENT_LLM_TIMEOUT,
                 )
             if exp and exp != SENTINEL_QUAL:
@@ -394,35 +394,48 @@ async def enrichment_pass(conn, deadline: datetime):
             f"({progress}%) | {fields_updated_total} fields updated"
         )
 
-    # Narration independence violations (still useful post-migration)
+    # Narration re-generation: independence violations AND generic fallback strings
+    # (fallback was written when Ollama was unavailable during collection)
     if datetime.now() < cutoff and not shutdown_requested:
         violations = conn.execute("""
-            SELECT id, gameplay_narration FROM gameplay_records
+            SELECT id, video_game_name, image_path,
+                   COALESCE(player_experience_narration, channel_description, '') AS context
+            FROM gameplay_records
             WHERE gameplay_narration ILIKE '%screenshot%'
                OR gameplay_narration ILIKE '%image%'
                OR gameplay_narration ILIKE '%as shown%'
                OR gameplay_narration ILIKE '%depicted%'
                OR gameplay_narration ILIKE '%visible%'
+               OR gameplay_narration ILIKE '%working through game mechanics and pursuing progression goals%'
         """).fetchall()
         if violations:
-            logger.info(f"Enrichment: {len(violations)} narration independence violations")
-            for rid, narr in violations:
-                if datetime.now() >= cutoff or shutdown_requested:
-                    break
+            logger.info(f"Enrichment: {len(violations)} narrations to regenerate")
+
+            async def _regen(rid: int, game_name: str, img_path: str, context: str):
                 try:
-                    game_name = conn.execute(
-                        "SELECT video_game_name FROM gameplay_records WHERE id = ?", [rid]
-                    ).fetchone()[0]
+                    article_text = context if context.strip() else f"A {game_name} gameplay session."
                     async with LLM_SEM:
-                        new_narr = await generate_narration(narr, game_name)
+                        new_narr = await generate_narration(
+                            article_text, game_name,
+                            image_path=img_path, model=LLM_MODEL,
+                        )
                     if new_narr and not IMAGE_REF_PATTERN.search(new_narr):
                         conn.execute(
                             "UPDATE gameplay_records SET gameplay_narration = ? WHERE id = ?",
-                            [new_narr, rid]
+                            [new_narr, rid],
                         )
-                        logger.info(f"Enrichment: Fixed narration for record {rid}")
+                        logger.info(f"Enrichment: regenerated narration for record {rid}")
                 except Exception:
                     pass
+
+            NARR_BATCH = LLM_CONCURRENCY * 2
+            for batch_start in range(0, len(violations), NARR_BATCH):
+                if datetime.now() >= cutoff or shutdown_requested:
+                    break
+                batch = violations[batch_start:batch_start + NARR_BATCH]
+                await asyncio.gather(*[_regen(r[0], r[1], r[2], r[3]) for r in batch])
+                pct = min(100, int((batch_start + len(batch)) / len(violations) * 100))
+                logger.info(f"Narration regen: {batch_start + len(batch)}/{len(violations)} ({pct}%)")
 
     # Image integrity check
     if datetime.now() < cutoff and not shutdown_requested:
@@ -449,7 +462,7 @@ async def enrichment_pass(conn, deadline: datetime):
 async def main():
     global shutdown_requested
 
-    parser = argparse.ArgumentParser(description="Production run: 1000 records")
+    parser = argparse.ArgumentParser(description="Production run: 10000 records")
     parser.add_argument("--llm-base-url", default="http://localhost:11434/v1")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from existing DB, skipping games already at target")
@@ -507,7 +520,7 @@ async def main():
     deadline = start + timedelta(hours=DEADLINE_HOURS)
 
     logger.info("=" * 70)
-    logger.info("PRODUCTION RUN -- 200 records x 5 games = 1000 total")
+    logger.info("PRODUCTION RUN -- 2000 records x 5 games = 10000 total")
     logger.info(f"Started:  {start.isoformat()}")
     logger.info(f"Deadline: {deadline.isoformat()} ({DEADLINE_HOURS}h window)")
     logger.info(f"LLM:      {args.llm_base_url}")
@@ -517,22 +530,21 @@ async def main():
     conn = init_db()
     hb_task = asyncio.create_task(heartbeat_loop(conn))
 
-    for game in GAMES:
+    async def _collect_game(game: dict, stagger_delay: float = 0.0) -> None:
+        if stagger_delay:
+            await asyncio.sleep(stagger_delay)
         if shutdown_requested:
-            logger.warning("Shutdown requested -- stopping before next game.")
-            break
+            return
         if datetime.now() >= deadline - timedelta(minutes=30):
-            logger.warning("Approaching deadline -- stopping game processing.")
-            break
-
+            logger.warning(f"[{game['name']}] Approaching deadline before start — skipping.")
+            return
         existing = conn.execute(
             "SELECT COUNT(*) FROM gameplay_records WHERE video_game_name = ?",
-            [game["name"]]
+            [game["name"]],
         ).fetchone()[0]
         if args.resume and existing >= game["target"]:
             logger.info(f"[{game['name']}] Already at {existing}/{game['target']} -- skipping.")
-            continue
-
+            return
         logger.info(f"\n{'='*50}")
         logger.info(f"  GAME: {game['name']} (existing: {existing}, target: {game['target']})")
         logger.info(f"{'='*50}")
@@ -540,53 +552,60 @@ async def main():
             await process_game(game, conn)
         except Exception as e:
             logger.error(f"[{game['name']}] FATAL: {e}", exc_info=True)
-            continue
 
-    if not args.skip_enrichment and not shutdown_requested:
-        time_remaining = deadline - datetime.now()
-        if time_remaining > timedelta(minutes=30):
-            logger.info(f"\n{time_remaining} remaining -- running enrichment pass...")
-            await enrichment_pass(conn, deadline)
-        else:
-            logger.info(f"Only {time_remaining} remaining -- skipping enrichment.")
-
-    logger.info(f"\n{'='*50}")
-    logger.info("  FINAL VALIDATION")
-    logger.info(f"{'='*50}")
-    report = validate_database(conn)
-    elapsed = datetime.now() - start
-
-    logger.info(f"\nPipeline completed in {elapsed}")
-    logger.info(f"Total records: {report['total_records']}/1000")
-    logger.info(f"\nValidation report:")
-    for k, v in report.items():
-        logger.info(f"  {k}: {v}")
-
-    if report["target_met"]:
-        logger.info("\nPRODUCTION TARGET MET (1000 records)")
-    else:
-        logger.error(f"\nTARGET NOT MET: {report['total_records']}/1000")
-        shortfall = {g: game["target"] - report["per_game"].get(g, 0)
-                     for game in GAMES for g in [game["name"]]
-                     if report["per_game"].get(g, 0) < game["target"]}
-        if shortfall:
-            logger.error(f"  Shortfall by game: {shortfall}")
-            logger.error(f"  Re-run with: python run_production.py --resume")
-
-    hb_task.cancel()
     try:
-        await hb_task
-    except asyncio.CancelledError:
-        pass
-    HEARTBEAT_FILE.write_text(json.dumps({
-        "timestamp": datetime.now().isoformat(),
-        "pid": os.getpid(),
-        "total_records": report.get("total_records", -1),
-        "per_game": report.get("per_game", {}),
-        "shutdown_requested": True,
-        "status": "completed" if report.get("target_met") else "incomplete",
-    }))
-    conn.close()
+        logger.info("Running all 5 games in parallel (staggered 10s apart)...")
+        await asyncio.gather(*[
+            _collect_game(game, stagger_delay=i * 10)
+            for i, game in enumerate(GAMES)
+        ])
+
+        if not args.skip_enrichment and not shutdown_requested:
+            time_remaining = deadline - datetime.now()
+            if time_remaining > timedelta(minutes=30):
+                logger.info(f"\n{time_remaining} remaining -- running enrichment pass...")
+                await enrichment_pass(conn, deadline)
+            else:
+                logger.info(f"Only {time_remaining} remaining -- skipping enrichment.")
+
+        logger.info(f"\n{'='*50}")
+        logger.info("  FINAL VALIDATION")
+        logger.info(f"{'='*50}")
+        report = validate_database(conn)
+        elapsed = datetime.now() - start
+
+        logger.info(f"\nPipeline completed in {elapsed}")
+        logger.info(f"Total records: {report['total_records']}/10000")
+        logger.info(f"\nValidation report:")
+        for k, v in report.items():
+            logger.info(f"  {k}: {v}")
+
+        if report["target_met"]:
+            logger.info("\nPRODUCTION TARGET MET (10000 records)")
+        else:
+            logger.error(f"\nTARGET NOT MET: {report['total_records']}/10000")
+            shortfall = {g: game["target"] - report["per_game"].get(g, 0)
+                         for game in GAMES for g in [game["name"]]
+                         if report["per_game"].get(g, 0) < game["target"]}
+            if shortfall:
+                logger.error(f"  Shortfall by game: {shortfall}")
+                logger.error(f"  Re-run with: game-predictor-run --resume")
+
+        hb_task.cancel()
+        try:
+            await hb_task
+        except asyncio.CancelledError:
+            pass
+        HEARTBEAT_FILE.write_text(json.dumps({
+            "timestamp": datetime.now().isoformat(),
+            "pid": os.getpid(),
+            "total_records": report.get("total_records", -1),
+            "per_game": report.get("per_game", {}),
+            "shutdown_requested": True,
+            "status": "completed" if report.get("target_met") else "incomplete",
+        }))
+    finally:
+        conn.close()
 
 def cli_main():
     """Sync entry point for console_scripts."""

@@ -230,7 +230,7 @@ def ensemble_evaluate(
 
 def run(
     db_path: str | Path = "data/gameplay_data.duckdb",
-    base_dir: str | Path = "data",
+    base_dir: str | Path = ".",
     batch_size: int = 32,
     warmup_epochs: int = 5,
     epochs: int = 30,

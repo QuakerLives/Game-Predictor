@@ -8,12 +8,13 @@ import logging
 import random
 from pathlib import Path
 
-from playwright.async_api import async_playwright, Browser, BrowserContext
+from playwright.async_api import async_playwright, Browser, BrowserContext, Playwright
 
 from game_predictor.config import IMAGE_DIR, SENTINEL_STR, USER_AGENTS, MIN_DELAY_SECONDS
 
 logger = logging.getLogger(__name__)
 
+_pw: Playwright | None = None
 _browser: Browser | None = None
 _context: BrowserContext | None = None
 
@@ -23,10 +24,10 @@ _MAX_SEEK_ATTEMPTS = 3
 
 async def _get_browser() -> tuple[Browser, BrowserContext]:
     """Return a lazily-initialised headless Chromium browser and context."""
-    global _browser, _context
+    global _pw, _browser, _context
     if _browser is None or not _browser.is_connected():
-        pw = await async_playwright().start()
-        _browser = await pw.chromium.launch(headless=True)
+        _pw = await async_playwright().start()
+        _browser = await _pw.chromium.launch(headless=True)
         _context = await _browser.new_context(
             user_agent=random.choice(USER_AGENTS),
             viewport={"width": 1280, "height": 720},
@@ -128,7 +129,7 @@ async def screenshot_youtube_video(
                 video_el = page.locator("video")
                 if await video_el.count() > 0:
                     await video_el.first.screenshot(path=str(dest_path))
-                    rel = str(dest_path)
+                    rel = dest_path.as_posix()
                     logger.info(
                         "Screenshot saved at %.1f%% (attempt %d): %s",
                         fraction * 100, attempt + 1, rel,
@@ -146,7 +147,7 @@ async def screenshot_youtube_video(
             player = page.locator("#movie_player")
             if await player.count() > 0:
                 await player.first.screenshot(path=str(dest_path))
-                rel = str(dest_path)
+                rel = dest_path.as_posix()
                 logger.warning("Fell back to player-area screenshot: %s", rel)
                 return rel
         except Exception:

@@ -18,7 +18,19 @@ from game_predictor.models import ImageResult
 logger = logging.getLogger(__name__)
 
 DELAY_MULTIPLIER = float(os.environ.get("SCRAPER_DELAY_MULTIPLIER", "1"))
-SEARCH_FALLBACK = os.environ.get("SCRAPER_SEARCH_FALLBACK", "").lower()
+SEARCH_FALLBACK = os.environ.get("SCRAPER_SEARCH_FALLBACK", "bing").lower()
+
+
+async def _close_browser(browser, pw) -> None:
+    """Close browser and playwright with a hard timeout to prevent hangs."""
+    try:
+        await asyncio.wait_for(browser.close(), timeout=10.0)
+    except Exception:
+        pass
+    try:
+        await asyncio.wait_for(pw.stop(), timeout=5.0)
+    except Exception:
+        pass
 
 
 async def create_browser():
@@ -28,14 +40,24 @@ async def create_browser():
     for closing all three in reverse order.
     """
     pw = await async_playwright().start()
-    browser = await pw.chromium.launch(
-        headless=True,
-        args=[
-            "--disable-blink-features=AutomationControlled",
-            "--disable-dev-shm-usage",
-            "--no-sandbox",
-        ],
-    )
+    try:
+        browser = await asyncio.wait_for(
+            pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                ],
+            ),
+            timeout=30.0,
+        )
+    except Exception:
+        try:
+            await asyncio.wait_for(pw.stop(), timeout=5.0)
+        except Exception:
+            pass
+        raise
     width = 1920 + random.randint(-50, 50)
     height = 1080 + random.randint(-50, 50)
     context = await browser.new_context(
@@ -75,8 +97,9 @@ async def _delay(seconds: float = 2.0) -> None:
 
 
 async def _gemma4_vision(page_or_bytes, prompt: str) -> str | None:
-    """Send a screenshot to Gemma 4 multimodal and return the text response."""
+    """Send a screenshot to the LLM and return the text response (streaming)."""
     import base64
+    import json as _json
     import httpx
     from game_predictor.config import LLM_MODEL, OLLAMA_NATIVE_URL
 
@@ -87,22 +110,46 @@ async def _gemma4_vision(page_or_bytes, prompt: str) -> str | None:
             await page_or_bytes.screenshot(full_page=False)
         ).decode("utf-8")
 
+    payload = {
+        "model": LLM_MODEL,
+        "prompt": prompt,
+        "images": [img_b64],
+        "stream": True,
+    }
+
+    def _sync() -> str | None:
+        try:
+            parts: list[str] = []
+            with httpx.Client() as client:
+                with client.stream(
+                    "POST",
+                    f"{OLLAMA_NATIVE_URL}/api/generate",
+                    json=payload,
+                    timeout=httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=5.0),
+                ) as resp:
+                    resp.raise_for_status()
+                    for raw_line in resp.iter_lines():
+                        if not raw_line.strip():
+                            continue
+                        try:
+                            chunk = _json.loads(raw_line)
+                        except _json.JSONDecodeError:
+                            continue
+                        parts.append(chunk.get("response", ""))
+                        if chunk.get("done"):
+                            break
+            return "".join(parts).strip() or None
+        except httpx.ReadTimeout:
+            logger.warning("LLM vision: ReadTimeout (no token for 30s)")
+            return None
+        except Exception:
+            logger.exception("LLM vision call failed")
+            return None
+
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"{OLLAMA_NATIVE_URL}/api/generate",
-                json={
-                    "model": LLM_MODEL,
-                    "prompt": prompt,
-                    "images": [img_b64],
-                    "stream": False,
-                },
-                timeout=180.0,
-            )
-            resp.raise_for_status()
-            return resp.json().get("response", "").strip()
+        return await asyncio.to_thread(_sync)
     except Exception:
-        logger.exception("Gemma 4 vision call failed")
+        logger.exception("to_thread failed in _gemma4_vision")
         return None
 
 
@@ -260,7 +307,15 @@ async def _attempt_captcha_solve(page) -> bool:
         try:
             analysis = _json.loads(cleaned)
         except _json.JSONDecodeError:
-            analysis = {"type": "other", "action": raw}
+            raw_lower = raw.lower()
+            if "checkbox" in raw_lower:
+                analysis = {"type": "checkbox", "action": "click checkbox"}
+            elif any(w in raw_lower for w in ("recaptcha_grid", "image grid", "select all")):
+                analysis = {"type": "recaptcha_grid", "action": "solve grid"}
+            elif any(w in raw_lower for w in ("consent", "accept", "agree")):
+                analysis = {"type": "consent", "action": "accept"}
+            else:
+                analysis = {"type": "other", "action": raw}
 
         captcha_type = analysis.get("type", "other")
 
@@ -304,17 +359,22 @@ async def _attempt_captcha_solve(page) -> bool:
 
 
 async def search_google_images(
-    query: str, num_results: int = 20
+    query: str, num_results: int = 20, page_offset: int = 0
 ) -> list[ImageResult]:
     """Search Google Images and return full-resolution image results.
 
     Falls back to Bing if SCRAPER_SEARCH_FALLBACK=bing or on CAPTCHA/failure.
+    page_offset is forwarded to the Bing fallback (Bing &first= parameter).
     """
     if SEARCH_FALLBACK == "bing":
         logger.info("SCRAPER_SEARCH_FALLBACK=bing — routing to Bing Images")
-        return await search_bing_images(query, num_results)
+        return await search_bing_images(query, num_results, page_offset)
 
-    pw, browser, context = await create_browser()
+    try:
+        pw, browser, context = await create_browser()
+    except Exception as exc:
+        logger.error("Google browser launch failed: %s — falling back to Bing", exc)
+        return await search_bing_images(query, num_results, page_offset)
     results: list[ImageResult] = []
     try:
         page = await context.new_page()
@@ -352,9 +412,8 @@ async def search_google_images(
                         continue
             if not grid_loaded:
                 logger.warning("Google Images unavailable — falling back to Bing")
-                await browser.close()
-                await pw.stop()
-                return await search_bing_images(query, num_results)
+                await _close_browser(browser, pw)
+                return await search_bing_images(query, num_results, page_offset)
 
         # Scroll to load more thumbnails
         for _ in range(3):
@@ -377,9 +436,8 @@ async def search_google_images(
 
         if not thumbnails:
             logger.warning("Google returned 0 thumbnails despite grid load — falling back to Bing")
-            await browser.close()
-            await pw.stop()
-            return await search_bing_images(query, num_results)
+            await _close_browser(browser, pw)
+            return await search_bing_images(query, num_results, page_offset)
 
         for thumb in thumbnails[: num_results + 10]:
             if len(results) >= num_results:
@@ -442,10 +500,9 @@ async def search_google_images(
 
     except Exception as exc:
         logger.error("Google Images failed: %s — falling back to Bing", exc)
-        results = await search_bing_images(query, num_results)
+        results = await search_bing_images(query, num_results, page_offset)
     finally:
-        await browser.close()
-        await pw.stop()
+        await _close_browser(browser, pw)
 
     logger.info("Google Images returned %d results for '%s'", len(results), query)
     return results
@@ -455,14 +512,23 @@ async def search_google_images(
 
 
 async def search_bing_images(
-    query: str, num_results: int = 20
+    query: str, num_results: int = 20, page_offset: int = 0
 ) -> list[ImageResult]:
-    """Fallback image search using Bing Images."""
-    pw, browser, context = await create_browser()
+    """Fallback image search using Bing Images.
+
+    page_offset maps to Bing's &first= parameter (0 = results 1-35,
+    35 = results 36-70, 70 = results 71-105, etc.).
+    """
+    try:
+        pw, browser, context = await create_browser()
+    except Exception as exc:
+        logger.error("Bing browser launch failed: %s", exc)
+        return []
     results: list[ImageResult] = []
     try:
         page = await context.new_page()
-        url = f"https://www.bing.com/images/search?q={quote(query)}"
+        first = page_offset + 1
+        url = f"https://www.bing.com/images/search?q={quote(query)}&first={first}"
         logger.info("Bing Images search: %s", query)
         await page.goto(url, wait_until="domcontentloaded", timeout=20000)
         await dismiss_cookie_consent(page)
@@ -473,9 +539,9 @@ async def search_bing_images(
             logger.warning("Bing image grid did not load")
             return results
 
-        for _ in range(3):
+        for _ in range(8):
             await page.evaluate("window.scrollBy(0, window.innerHeight)")
-            await _delay(1.0)
+            await _delay(0.5)
 
         thumbnails = await page.query_selector_all(
             ".iusc, .imgpt a, li[data-idx] a.iusc"
@@ -531,8 +597,7 @@ async def search_bing_images(
     except Exception as exc:
         logger.error("Bing Images search failed: %s", exc)
     finally:
-        await browser.close()
-        await pw.stop()
+        await _close_browser(browser, pw)
 
     logger.info("Bing Images returned %d results for '%s'", len(results), query)
     return results
@@ -545,7 +610,11 @@ async def search_youtube(
     query: str, num_results: int = 15
 ) -> list[dict]:
     """Search YouTube and extract video metadata from the results page."""
-    pw, browser, context = await create_browser()
+    try:
+        pw, browser, context = await create_browser()
+    except Exception as exc:
+        logger.error("YouTube browser launch failed: %s", exc)
+        return []
     results: list[dict] = []
     try:
         page = await context.new_page()
@@ -653,8 +722,7 @@ async def search_youtube(
     except Exception as exc:
         logger.error("YouTube search failed: %s", exc)
     finally:
-        await browser.close()
-        await pw.stop()
+        await _close_browser(browser, pw)
 
     logger.info("YouTube returned %d results for '%s'", len(results), query)
     return results

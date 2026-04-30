@@ -271,7 +271,7 @@ async def process_game(game: dict, conn):
         if current_count() >= google_target or shutdown_requested:
             break
 
-        for page in range(4):  # up to 4 pages (≈140 candidates) per query
+        for page in range(8):  # up to 8 pages (≈280 candidates) per query
             if current_count() >= google_target or shutdown_requested:
                 break
 

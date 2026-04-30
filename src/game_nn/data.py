@@ -11,13 +11,14 @@ Preprocessing order (all fitted on training split ONLY):
 
 from __future__ import annotations
 
+import re
+
 import duckdb
 import numpy as np
 from dataclasses import dataclass, field
 from pathlib import Path
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
-from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.impute import SimpleImputer
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
@@ -43,9 +44,62 @@ class SplitData:
         self.n_classes = len(self.label_names)
 
 
+_EMBED_MODEL = "all-MiniLM-L6-v2"
+
+# Same scrub list as game_transformer — removes game names so the model learns
+# gameplay patterns, not trivial name recognition.
+_SCRUB_PATTERNS: list[re.Pattern] = [
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        r"apex legends", r"no man'?s sky", r"the elder scrolls\s+v",
+        r"elder scrolls", r"skyrim", r"dragonborn", r"stardew valley", r"stellaris",
+    ]
+]
+
+
+def _sanitize(text: str) -> str:
+    for pat in _SCRUB_PATTERNS:
+        text = pat.sub("the game", text)
+    return text.strip()
+
+
 _EXP_LEVEL_MAP: dict[str, float] = {
     "Poor": 0.0, "Fair": 1.0, "Good": 2.0, "Excellent": 3.0, "Superior": 4.0,
 }
+
+# gameplay_records.video_game_name → Steam appid
+_GAME_TO_APPID: dict[str, int] = {
+    "Apex Legends":   1172470,
+    "No Man's Sky":   275850,
+    "Skyrim":         489830,
+    "Stardew Valley": 413150,
+    "Stellaris":      281990,
+}
+
+_STEAM_AGG_QUERY = """
+SELECT
+    g.appid,
+    COUNT(DISTINCT as_.name)            AS total_achievements,
+    COALESCE(AVG(a.percent),   0.0)     AS avg_completion_pct,
+    COALESCE(MIN(a.percent),   0.0)     AS min_completion_pct,
+    COALESCE(MAX(a.percent),   0.0)     AS max_completion_pct,
+    COALESCE(AVG(pc.player_count), 0.0) AS avg_player_count,
+    COALESCE(MAX(pc.player_count), 0.0) AS peak_player_count,
+    COUNT(DISTINCT n.gid)               AS news_count
+FROM games g
+LEFT JOIN achievement_schema as_ ON g.appid = as_.appid
+LEFT JOIN achievements       a   ON g.appid = a.appid
+LEFT JOIN player_counts      pc  ON g.appid = pc.appid
+LEFT JOIN news               n   ON g.appid = n.appid
+GROUP BY g.appid
+"""
+
+_STEAM_FEATURE_NAMES = [
+    "steam_total_achievements", "steam_avg_completion_pct",
+    "steam_min_completion_pct", "steam_max_completion_pct",
+    "steam_avg_player_count",   "steam_peak_player_count",
+    "steam_news_count",
+]
 
 _GAMEPLAY_QUERY = """
 SELECT
@@ -276,23 +330,26 @@ def build_dataset(
 
 def build_dataset_from_gameplay(
     db_path: str | Path = "data/gameplay_data.duckdb",
+    steam_db_path: str | Path = "data/steam_data.duckdb",
     test_record_ids: list[int] | None = None,
-    tfidf_max_features: int = 100,
+    embed_model: str = _EMBED_MODEL,
     val_ratio: float = 0.15,
     test_ratio: float = 0.15,
     seed: int = 42,
+    embed_batch_size: int = 64,
 ) -> SplitData:
     """Build a feature matrix from gameplay_records for the ensemble NN.
 
-    Features (6 numerical + up to tfidf_max_features TF-IDF terms):
-      experience_level (ordinal 0-4), is_youtube (binary),
-      has_player_name, has_timestamp, has_channel_desc (all binary),
-      narration_len (continuous),
-      + TF-IDF top-N terms from gameplay_narration text
+    Features: 384-dim narration embedding + 6 per-record metadata + 7 Steam API features.
+      - all-MiniLM-L6-v2 embedding of gameplay_narration (scrubbed of game names)
+      - experience_level, is_youtube, has_player_name, has_timestamp,
+        has_channel_desc, narration_len  (per-record, from gameplay_data.duckdb)
+      - total_achievements, avg/min/max completion %, avg/peak player count,
+        news count  (per-game from steam_data.duckdb, joined by game name)
 
-    TF-IDF is fitted on the training split only (no leakage). Game-specific
-    vocabulary in the narrations ("fleet", "empire" → Stellaris; "harvest",
-    "farm" → Stardew Valley) gives the model genuine signal to learn from.
+    The narration embedding drives per-record discrimination; Steam features add
+    a game-profile fingerprint from an external source without dominating, since
+    they are 7 values out of 397 total input dimensions.
 
     gameplay_level and total_playtime were dropped (97%/95% NULL → zero-variance
     constants after median imputation, no signal).
@@ -319,10 +376,9 @@ def build_dataset_from_gameplay(
         exp_enc = _EXP_LEVEL_MAP.get(r[2], np.nan)
         is_yt = 1.0 if r[3] == "youtube" else 0.0
         X_num_rows.append([exp_enc, is_yt, float(r[4]), float(r[5]), float(r[6]), float(r[7] or 0)])
-        texts.append(r[8])
+        texts.append(_sanitize(r[8]))
 
     X_num = np.array(X_num_rows, dtype=np.float64)
-    texts_arr = np.array(texts, dtype=object)
     num_feature_names = [
         "experience_level", "is_youtube",
         "has_player_name", "has_timestamp", "has_channel_desc", "narration_len",
@@ -332,49 +388,81 @@ def build_dataset_from_gameplay(
     nan_counts = {num_feature_names[i]: int(np.isnan(X_num[:, i]).sum()) for i in range(X_num.shape[1])}
     print(f"[nn-gameplay] NaN counts: {nan_counts}")
 
-    # Split — shared or independent; carry texts through the same split
+    # Embed all narrations up-front (encoder is pretrained — no train/test leakage)
+    print(f"[nn-gameplay] encoding narrations with {embed_model} ...")
+    from sentence_transformers import SentenceTransformer
+    encoder = SentenceTransformer(embed_model)
+    X_emb = encoder.encode(texts, batch_size=embed_batch_size, show_progress_bar=True).astype(np.float64)
+    print(f"[nn-gameplay] embedding dim: {X_emb.shape[1]}")
+
+    # Load Steam API features and join by game name
+    steam_path = Path(steam_db_path)
+    if steam_path.exists():
+        conn_s = duckdb.connect(str(steam_path), read_only=True)
+        steam_rows = conn_s.execute(_STEAM_AGG_QUERY).fetchall()
+        conn_s.close()
+        appid_to_feats: dict[int, list[float]] = {
+            int(r[0]): [float(v) for v in r[1:]] for r in steam_rows
+        }
+        X_steam_rows = []
+        for r in rows:
+            appid = _GAME_TO_APPID.get(r[1])
+            feats = appid_to_feats.get(appid, [0.0] * len(_STEAM_FEATURE_NAMES)) if appid else [0.0] * len(_STEAM_FEATURE_NAMES)
+            X_steam_rows.append(feats)
+        X_steam = np.array(X_steam_rows, dtype=np.float64)
+        print(f"[nn-gameplay] Steam API features joined ({len(_STEAM_FEATURE_NAMES)} features from {steam_path})")
+    else:
+        X_steam = np.zeros((len(rows), len(_STEAM_FEATURE_NAMES)), dtype=np.float64)
+        print(f"[nn-gameplay] steam_data.duckdb not found — Steam features zeroed")
+
+    # Split — shared or independent; all three arrays split together
     if test_record_ids is not None:
         id_to_pos = {int(rid): i for i, rid in enumerate(record_ids.tolist())}
         te_indices = [id_to_pos[rid] for rid in test_record_ids if rid in id_to_pos]
         te_set = set(te_indices)
         tr_val_indices = [i for i in range(len(record_ids)) if i not in te_set]
 
-        X_te, y_te = X_num[te_indices], y[te_indices]
-        texts_te = texts_arr[te_indices]
-        X_rest, y_rest = X_num[tr_val_indices], y[tr_val_indices]
-        texts_rest = texts_arr[tr_val_indices]
+        X_num_te, X_emb_te, X_steam_te, y_te = (
+            X_num[te_indices], X_emb[te_indices], X_steam[te_indices], y[te_indices],
+        )
+        X_num_rest, X_emb_rest, X_steam_rest, y_rest = (
+            X_num[tr_val_indices], X_emb[tr_val_indices], X_steam[tr_val_indices], y[tr_val_indices],
+        )
 
         adjusted_val = val_ratio / (1.0 - test_ratio)
-        X_tr, X_va, y_tr, y_va, texts_tr, texts_va = train_test_split(
-            X_rest, y_rest, texts_rest, test_size=adjusted_val, stratify=y_rest, random_state=seed,
+        X_num_tr, X_num_va, X_emb_tr, X_emb_va, X_steam_tr, X_steam_va, y_tr, y_va = train_test_split(
+            X_num_rest, X_emb_rest, X_steam_rest, y_rest,
+            test_size=adjusted_val, stratify=y_rest, random_state=seed,
         )
         print(f"[nn-gameplay] shared split  train={len(y_tr)}  val={len(y_va)}  test={len(y_te)}")
     else:
         holdout = val_ratio + test_ratio
-        X_tr, X_tmp, y_tr, y_tmp, texts_tr, texts_tmp = train_test_split(
-            X_num, y, texts_arr, test_size=holdout, stratify=y, random_state=seed,
+        X_num_tr, X_num_tmp, X_emb_tr, X_emb_tmp, X_steam_tr, X_steam_tmp, y_tr, y_tmp = train_test_split(
+            X_num, X_emb, X_steam, y, test_size=holdout, stratify=y, random_state=seed,
         )
         rel_test = test_ratio / holdout
-        X_va, X_te, y_va, y_te, texts_va, texts_te = train_test_split(
-            X_tmp, y_tmp, texts_tmp, test_size=rel_test, stratify=y_tmp, random_state=seed,
+        X_num_va, X_num_te, X_emb_va, X_emb_te, X_steam_va, X_steam_te, y_va, y_te = train_test_split(
+            X_num_tmp, X_emb_tmp, X_steam_tmp, y_tmp,
+            test_size=rel_test, stratify=y_tmp, random_state=seed,
         )
         print(f"[nn-gameplay] split  train={len(y_tr)}  val={len(y_va)}  test={len(y_te)}")
 
-    # Impute NaNs on numerical features (train-fit only)
-    X_tr, X_va, X_te, _ = impute(X_tr, X_va, X_te)
+    # Impute NaNs on numerical features (train-fit only; embeddings and Steam are clean)
+    X_num_tr, X_num_va, X_num_te, _ = impute(X_num_tr, X_num_va, X_num_te)
 
-    # TF-IDF on narration text (train-fit only — no leakage)
-    tfidf = TfidfVectorizer(max_features=tfidf_max_features, stop_words="english", min_df=2)
-    Xtf_tr = tfidf.fit_transform(texts_tr.tolist()).toarray()
-    Xtf_va = tfidf.transform(texts_va.tolist()).toarray()
-    Xtf_te = tfidf.transform(texts_te.tolist()).toarray()
-    tfidf_names = tfidf.get_feature_names_out().tolist()
-    print(f"[nn-gameplay] TF-IDF vocabulary size: {len(tfidf_names)}")
-
-    X_tr = np.hstack([X_tr, Xtf_tr])
-    X_va = np.hstack([X_va, Xtf_va])
-    X_te = np.hstack([X_te, Xtf_te])
-    feature_names = num_feature_names + tfidf_names
+    # Combine: [6 metadata | 384-dim embedding | 7 Steam features]
+    X_tr = np.hstack([X_num_tr, X_emb_tr, X_steam_tr])
+    X_va = np.hstack([X_num_va, X_emb_va, X_steam_va])
+    X_te = np.hstack([X_num_te, X_emb_te, X_steam_te])
+    feature_names = (
+        num_feature_names
+        + [f"emb_{i}" for i in range(X_emb.shape[1])]
+        + _STEAM_FEATURE_NAMES
+    )
+    print(
+        f"[nn-gameplay] feature dim: {X_tr.shape[1]} "
+        f"(6 metadata + {X_emb.shape[1]} embedding + {len(_STEAM_FEATURE_NAMES)} Steam)"
+    )
 
     # Standardize the full feature matrix (train-fit only)
     X_tr, X_va, X_te, _ = standardize(X_tr, X_va, X_te)

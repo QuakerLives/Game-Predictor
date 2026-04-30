@@ -101,7 +101,7 @@ def load_eda_data() -> dict:
     ).fetchall():
         experience_dist.setdefault(level, {})[game] = cnt
 
-    # NULL density — one aggregation query for all fields
+    # NULL density — single aggregation query for all fields
     null_sel = ", ".join(
         f"SUM(CASE WHEN {f} IS NULL THEN 1 ELSE 0 END) AS n_{f}"
         for f in _NULL_FIELDS

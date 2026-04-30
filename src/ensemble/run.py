@@ -93,9 +93,8 @@ def run() -> None:
             model_names.append("NN (gameplay features)")
             print(f"  NN (gameplay features) included — {len(nn_y)} test records")
     else:
-        print(
-            "  [optional] NN not found — run 'python -m game_nn --gameplay' to add it.\n"
-        )
+        print("  [optional] NN not found — run 'python -m game_nn --gameplay' to add it.")
+
 
     label_names = cnn_labels
     y_true = cnn_y

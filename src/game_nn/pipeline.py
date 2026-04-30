@@ -139,11 +139,11 @@ def ensemble_evaluate(
 
 def run_on_gameplay_data(
     gameplay_db_path: str | Path = "data/gameplay_data.duckdb",
-    hidden_dims: tuple[int, ...] = (128, 64, 32),
+    hidden_dims: tuple[int, ...] = (256, 128, 64),
     dropout: float = 0.3,
     lr: float = 1e-3,
     epochs: int = 300,
-    batch_size: int = 32,
+    batch_size: int = 64,
 ) -> None:
     """Train NN on gameplay numerical features and save outputs for ensemble.
 

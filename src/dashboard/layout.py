@@ -2,8 +2,9 @@
 Dashboard layout: four tabs covering EDA, model performance, live demo,
 and AI methodology documentation required by the project rubric.
 
-Figure-building functions are defined here so callbacks.py can import them
-without any circular dependencies.
+All figures are built with plotly.graph_objects only — no plotly.express,
+no polars, no pandas — to avoid native thread-pool deadlocks on Windows
+with PyTorch CUDA installed.
 """
 from __future__ import annotations
 
@@ -11,7 +12,7 @@ import dash_bootstrap_components as dbc
 from dash import dcc, html
 
 from .data_loader import (
-    load_gameplay_df,
+    load_eda_data,
     load_model_results,
     GAME_COLORS,
     MODEL_COLORS,
@@ -19,22 +20,18 @@ from .data_loader import (
     EXP_COLORS,
 )
 
-# ── Lazy plotting imports (pandas + plotly are slow to import on Windows) ─────
+# ── Lazy plotly import ────────────────────────────────────────────────────────
 
-go = px = pl = None  # populated on first call to _ensure_plotting()
+go = None  # populated on first call to _ensure_plotting()
 
 
 def _ensure_plotting() -> None:
-    """Import plotting libraries on first use and inject them as module globals."""
+    """Import plotly.graph_objects on first use (it's already fast, but kept lazy)."""
     import sys
     mod = sys.modules[__name__]
     if mod.go is None:
         import plotly.graph_objects as _go
-        import plotly.express as _px
-        import polars as _pl
         mod.go = _go
-        mod.px = _px
-        mod.pl = _pl
 
 
 # ── Shared chart style ────────────────────────────────────────────────────────
@@ -52,87 +49,88 @@ PLOT_LAYOUT: dict = dict(
 # ── EDA figure builders ───────────────────────────────────────────────────────
 
 
-def records_per_game_fig(df) -> "go.Figure":
+def records_per_game_fig(data: dict) -> "go.Figure":
     _ensure_plotting()
-    counts = df["video_game_name"].value_counts(sort=True)
-    fig = px.bar(
-        counts, x="video_game_name", y="count",
-        color="video_game_name", color_discrete_map=GAME_COLORS,
-        title="Records Collected per Game",
-        labels={"count": "Record Count", "video_game_name": "Game"},
-        text="count",
-    )
-    fig.update_traces(textposition="outside")
+    games  = data["games"]
+    counts = [data["records_per_game"].get(g, 0) for g in games]
+    colors = [GAME_COLORS.get(g, "#adb5bd") for g in games]
+    fig = go.Figure(go.Bar(
+        x=games, y=counts, marker_color=colors,
+        text=counts, textposition="outside",
+    ))
     fig.add_hline(y=2000, line_dash="dash", line_color="#adb5bd",
                   annotation_text="Target (2,000)", annotation_position="top right")
-    fig.update_layout(**PLOT_LAYOUT, showlegend=False,
-                      yaxis=dict(title="Record Count", gridcolor="#373b3e"))
+    fig.update_layout(
+        **PLOT_LAYOUT, showlegend=False,
+        title="Records Collected per Game",
+        xaxis_title="Game",
+        yaxis=dict(title="Record Count", gridcolor="#373b3e"),
+    )
     return fig
 
 
-def source_type_fig(df) -> "go.Figure":
+def source_type_fig(data: dict) -> "go.Figure":
     _ensure_plotting()
-    counts = (
-        df.group_by(["video_game_name", "source_type"])
-        .len()
-        .rename({"len": "Count"})
-    )
-    fig = px.bar(
-        counts, x="video_game_name", y="Count",
-        color="source_type", barmode="group",
+    games = data["games"]
+    stb   = data["source_type_breakdown"]
+    SOURCE_COLORS = {"google_images": "#2196F3", "youtube": "#F44336"}
+    SOURCE_LABELS = {"google_images": "Google Images", "youtube": "YouTube"}
+    fig = go.Figure()
+    for src, game_counts in stb.items():
+        fig.add_trace(go.Bar(
+            name=SOURCE_LABELS.get(src, src),
+            x=games,
+            y=[game_counts.get(g, 0) for g in games],
+            marker_color=SOURCE_COLORS.get(src, "#adb5bd"),
+        ))
+    fig.update_layout(
+        **PLOT_LAYOUT, barmode="group",
         title="Source Type Breakdown per Game",
-        color_discrete_map={"google_images": "#2196F3", "youtube": "#F44336"},
-        labels={"video_game_name": "Game", "source_type": "Source", "Count": "Records"},
+        xaxis_title="Game",
+        yaxis=dict(title="Records", gridcolor="#373b3e"),
+        legend_title_text="Source",
     )
-    fig.update_layout(**PLOT_LAYOUT, yaxis=dict(gridcolor="#373b3e"),
-                      legend_title_text="Source")
     return fig
 
 
-def experience_dist_fig(df) -> "go.Figure":
+def experience_dist_fig(data: dict) -> "go.Figure":
     _ensure_plotting()
-    counts = (
-        df.filter(pl.col("experience_level").is_not_null())
-        .group_by(["video_game_name", "experience_level"])
-        .len()
-        .rename({"len": "Count"})
-    )
-    fig = px.bar(
-        counts, x="video_game_name", y="Count",
-        color="experience_level", barmode="stack",
+    games    = data["games"]
+    exp_dist = data["experience_dist"]
+    fig = go.Figure()
+    for level in EXP_LEVELS:
+        if level not in exp_dist:
+            continue
+        game_counts = exp_dist[level]
+        fig.add_trace(go.Bar(
+            name=level,
+            x=games,
+            y=[game_counts.get(g, 0) for g in games],
+            marker_color=EXP_COLORS.get(level, "#adb5bd"),
+        ))
+    fig.update_layout(
+        **PLOT_LAYOUT, barmode="stack",
         title="Experience Level Distribution per Game",
-        color_discrete_map=EXP_COLORS,
-        category_orders={"experience_level": EXP_LEVELS},
-        labels={"video_game_name": "Game", "experience_level": "Level", "Count": "Records"},
+        xaxis_title="Game",
+        yaxis=dict(title="Records", gridcolor="#373b3e"),
+        legend_title_text="Experience",
     )
-    fig.update_layout(**PLOT_LAYOUT, yaxis=dict(gridcolor="#373b3e"),
-                      legend_title_text="Experience")
     return fig
 
 
-def null_heatmap_fig(df) -> "go.Figure":
+def null_heatmap_fig(data: dict) -> "go.Figure":
     _ensure_plotting()
-    fields = [
-        "player_name", "gameplay_timestamp", "experience_level",
-        "gameplay_level", "total_playtime",
-        "channel_description", "player_experience_narration",
-    ]
-    games = sorted(df["video_game_name"].unique().to_list())
+    games  = data["games"]
+    fields = data["null_fields"]
+    npct   = data["null_pct"]
     z, text = [], []
     for field in fields:
-        row_z, row_t = [], []
-        for game in games:
-            sub = df.filter(pl.col("video_game_name") == game)[field]
-            pct = sub.is_null().mean() * 100
-            row_z.append(pct)
-            row_t.append(f"{pct:.1f}%")
-        z.append(row_z)
-        text.append(row_t)
-
+        row_pct = [npct.get(field, {}).get(g, 0) for g in games]
+        z.append(row_pct)
+        text.append([f"{v:.1f}%" for v in row_pct])
     fig = go.Figure(go.Heatmap(
         z=z, x=games, y=fields,
-        colorscale="RdYlGn_r",
-        zmin=0, zmax=100,
+        colorscale="RdYlGn_r", zmin=0, zmax=100,
         text=text, texttemplate="%{text}",
         colorbar=dict(title="NULL %", ticksuffix="%"),
     ))
@@ -145,18 +143,24 @@ def null_heatmap_fig(df) -> "go.Figure":
     return fig
 
 
-def narration_box_fig(df) -> "go.Figure":
+def narration_box_fig(data: dict) -> "go.Figure":
     _ensure_plotting()
-    fig = px.box(
-        df.filter(pl.col("narration_len") > 0),
-        x="video_game_name", y="narration_len",
-        color="video_game_name", color_discrete_map=GAME_COLORS,
+    games = data["games"]
+    narr  = data["narration_lengths"]
+    fig = go.Figure()
+    for game in games:
+        lengths = narr.get(game, [])
+        if lengths:
+            fig.add_trace(go.Box(
+                y=lengths, name=game,
+                marker_color=GAME_COLORS.get(game, "#adb5bd"),
+                boxpoints=False,
+            ))
+    fig.update_layout(
+        **PLOT_LAYOUT, showlegend=False,
         title="Gameplay Narration Length",
-        labels={"video_game_name": "Game", "narration_len": "Characters"},
-        points=False,
+        yaxis=dict(title="Characters", gridcolor="#373b3e"),
     )
-    fig.update_layout(**PLOT_LAYOUT, showlegend=False,
-                      yaxis=dict(gridcolor="#373b3e"))
     return fig
 
 
@@ -198,7 +202,6 @@ def confusion_matrix_fig(results: dict, model_key: str) -> "go.Figure":
     data    = results[model_key]
     cm      = data["cm"]
     lnames  = data["label_names"]
-    # Row-normalize for color scale; show raw counts as annotation text
     row_sum = cm.sum(axis=1, keepdims=True).clip(1)
     cm_norm = cm.astype(float) / row_sum
     label   = _MODEL_DISPLAY[model_key]
@@ -247,59 +250,50 @@ def perclass_fig(results: dict, model_key: str) -> "go.Figure":
 
 def build_eda_tab() -> dbc.Container:
     _ensure_plotting()
-    df    = load_gameplay_df()
-    total = len(df)
-    n_gg  = df.filter(pl.col("source_type") == "google_images").height
-    n_yt  = df.filter(pl.col("source_type") == "youtube").height
-    exp_ok = int(df["experience_level"].is_not_null().sum())
+    data   = load_eda_data()
+    total  = data["total"]
+    n_gg   = data["n_gg"]
+    n_yt   = data["n_yt"]
+    exp_ok = data["exp_ok"]
 
     return dbc.Container([
-        # ── Summary cards ──────────────────────────────────────────────────
         dbc.Row([
-            dbc.Col(_stat_card(f"{total:,}",  "Total Records",         "#2196F3"), width=3),
-            dbc.Col(_stat_card("5",            "Games Tracked",         "#9C27B0"), width=3),
-            dbc.Col(_stat_card(f"{n_gg:,}",   "Google Image Records",  "#F44336"), width=3),
-            dbc.Col(_stat_card(f"{n_yt:,}",   "YouTube Records",       "#FF9800"), width=3),
+            dbc.Col(_stat_card(f"{total:,}",  "Total Records",        "#2196F3"), width=3),
+            dbc.Col(_stat_card("5",            "Games Tracked",        "#9C27B0"), width=3),
+            dbc.Col(_stat_card(f"{n_gg:,}",   "Google Image Records", "#F44336"), width=3),
+            dbc.Col(_stat_card(f"{n_yt:,}",   "YouTube Records",      "#FF9800"), width=3),
         ], className="mb-4 mt-3 g-3"),
-
-        # ── Row 1: records per game + source breakdown ──────────────────────
         dbc.Row([
-            dbc.Col(dcc.Graph(figure=records_per_game_fig(df), config=PLOT_CONFIG), width=6),
-            dbc.Col(dcc.Graph(figure=source_type_fig(df),      config=PLOT_CONFIG), width=6),
+            dbc.Col(dcc.Graph(figure=records_per_game_fig(data), config=PLOT_CONFIG), width=6),
+            dbc.Col(dcc.Graph(figure=source_type_fig(data),      config=PLOT_CONFIG), width=6),
         ], className="mb-3"),
-
-        # ── Row 2: experience level distribution ───────────────────────────
         dbc.Row([
-            dbc.Col(dcc.Graph(figure=experience_dist_fig(df), config=PLOT_CONFIG), width=12),
+            dbc.Col(dcc.Graph(figure=experience_dist_fig(data), config=PLOT_CONFIG), width=12),
         ], className="mb-3"),
-
-        # ── Row 3: NULL heatmap + narration length ─────────────────────────
         dbc.Row([
-            dbc.Col(dcc.Graph(figure=null_heatmap_fig(df),   config=PLOT_CONFIG), width=7),
-            dbc.Col(dcc.Graph(figure=narration_box_fig(df),  config=PLOT_CONFIG), width=5),
+            dbc.Col(dcc.Graph(figure=null_heatmap_fig(data),  config=PLOT_CONFIG), width=7),
+            dbc.Col(dcc.Graph(figure=narration_box_fig(data), config=PLOT_CONFIG), width=5),
         ], className="mb-3"),
     ], fluid=True)
 
 
 def build_performance_tab() -> dbc.Container:
+    _ensure_plotting()
     results = load_model_results()
     options = [
-        {"label": "CNN  (EfficientNet-B0 image classifier)",  "value": "cnn"},
-        {"label": "NN  (Fully-connected on narration + metadata)", "value": "nn"},
-        {"label": "Transformer  (MiniLM-L6 text embeddings)",  "value": "transformer"},
-        {"label": "Ensemble  (averaged softmax probabilities)", "value": "ensemble"},
+        {"label": "CNN  (EfficientNet-B0 image classifier)",       "value": "cnn"},
+        {"label": "NN  (Fully-connected on narration + metadata)",  "value": "nn"},
+        {"label": "Transformer  (MiniLM-L6 text embeddings)",       "value": "transformer"},
+        {"label": "Ensemble  (averaged softmax probabilities)",      "value": "ensemble"},
     ]
     available = [o for o in options if o["value"] in results]
     default   = available[0]["value"] if available else None
 
     return dbc.Container([
-        # ── Overall accuracy comparison ────────────────────────────────────
         dbc.Row([
             dbc.Col(dcc.Graph(figure=accuracy_bar_fig(results), config=PLOT_CONFIG),
                     width=12),
         ], className="mb-3 mt-3"),
-
-        # ── Model selector ─────────────────────────────────────────────────
         dbc.Row([
             dbc.Col([
                 html.P("Select a model to inspect its confusion matrix and per-class accuracy:",
@@ -313,8 +307,6 @@ def build_performance_tab() -> dbc.Container:
                 ),
             ], width=12),
         ]),
-
-        # ── Confusion matrix + per-class accuracy ──────────────────────────
         dbc.Row([
             dbc.Col(dcc.Graph(id="confusion-matrix-fig", config=PLOT_CONFIG), width=7),
             dbc.Col(dcc.Graph(id="perclass-fig",         config=PLOT_CONFIG), width=5),
@@ -351,9 +343,7 @@ def build_live_demo_tab() -> dbc.Container:
                 ),
                 html.Div(id="upload-status", className="mt-2 text-muted small"),
             ], width=4),
-
             dbc.Col(html.Div(id="preview-img-container"), width=3),
-
             dbc.Col(dcc.Graph(id="prediction-bar", config=PLOT_CONFIG,
                               style={"height": "300px"}), width=5),
         ], className="mt-3"),
@@ -407,38 +397,15 @@ _CARD_4_BODY = (
 
 def build_methodology_tab() -> dbc.Container:
     _ensure_plotting()
-    df = load_gameplay_df()
-
-    # Sample two records per game to illustrate AI-generated content
-    df_narr = df.filter(pl.col("gameplay_narration").is_not_null())
-    samples = []
-    for game in sorted(df_narr["video_game_name"].unique().to_list()):
-        group = df_narr.filter(pl.col("video_game_name") == game)
-        samples.append(group.sample(n=min(2, group.height), seed=42))
-    sample_df = pl.concat(samples).select(
-        ["video_game_name", "source_type", "experience_level", "gameplay_narration"]
-    ).with_columns(
-        (
-            pl.col("gameplay_narration").str.slice(0, 220)
-            + pl.when(pl.col("gameplay_narration").str.len_chars() > 220)
-            .then(pl.lit("..."))
-            .otherwise(pl.lit(""))
-        ).alias("gameplay_narration")
-    ).rename({
-        "video_game_name": "Game",
-        "source_type": "Source",
-        "experience_level": "Experience",
-        "gameplay_narration": "AI-Generated Narration",
-    })
-
-    col_names = sample_df.columns
-    rows_data = sample_df.to_dicts()
+    data        = load_eda_data()
+    sample_rows = data["sample_rows"]
+    headers     = ["Game", "Source", "Experience", "AI-Generated Narration"]
     table = dbc.Table(
         [
-            html.Thead(html.Tr([html.Th(c) for c in col_names])),
+            html.Thead(html.Tr([html.Th(h) for h in headers])),
             html.Tbody([
-                html.Tr([html.Td(str(r.get(c, ""))) for c in col_names])
-                for r in rows_data
+                html.Tr([html.Td(str(cell or "")) for cell in row])
+                for row in sample_rows
             ]),
         ],
         striped=True, bordered=True, hover=True,

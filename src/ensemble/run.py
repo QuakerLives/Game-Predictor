@@ -118,11 +118,11 @@ def run() -> None:
         print(f"  {name:<30s} {acc:>10.4f} {ll:>10.4f}")
 
     print()
-    for strategy in ("average", "weighted", "learned"):
+    for strategy in ("average", "weighted", "learned", "proportional"):
         c = EnsembleCombiner(strategy=strategy)
         if strategy == "weighted":
             c.weights = np.ones(n) / n
-        if strategy == "learned":
+        if strategy in ("learned", "proportional"):
             c.fit(probs_list, y_true)
         result = c.evaluate(probs_list, y_true, label_names)
         print(
@@ -132,12 +132,12 @@ def run() -> None:
 
     print()
 
-    # Best combined result (learned weights)
-    combiner = EnsembleCombiner(strategy="learned")
+    # Best combined result (proportional weights — balanced and interpretable)
+    combiner = EnsembleCombiner(strategy="proportional")
     combiner.fit(probs_list, y_true)
     result = combiner.evaluate(probs_list, y_true, label_names)
 
-    print("── Final ensemble (learned weights) ──")
+    print("── Final ensemble (proportional weights) ──")
     print(f"  Accuracy : {result['accuracy']:.4f}")
     print(f"  Log-loss : {result['log_loss']:.4f}")
     print()

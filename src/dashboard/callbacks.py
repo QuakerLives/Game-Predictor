@@ -61,9 +61,13 @@ def update_prediction(contents, filename):
         style={"width": "100%", "borderRadius": "6px", "marginTop": "8px"},
     )
 
-    probs = predict_from_b64(contents)
+    try:
+        probs = predict_from_b64(contents)
+    except Exception as exc:
+        err_fig = go.Figure().update_layout(**PLOT_LAYOUT, title=f"Inference error: {exc}")
+        return preview, err_fig, f"Error processing {filename}: {exc}"
     if not probs:
-        no_model = go.Figure().update_layout(**PLOT_LAYOUT, title="CNN model not found")
+        no_model = go.Figure().update_layout(**PLOT_LAYOUT, title="CNN model not found — run game-cnn-train first")
         return preview, no_model, f"Uploaded: {filename}"
 
     # Sort ascending so the highest bar appears at the top of a horizontal chart
@@ -80,8 +84,8 @@ def update_prediction(contents, filename):
         text=[f"{s:.1f}%" for s in scores],
         textposition="outside",
     ))
+    fig.update_layout(**PLOT_LAYOUT)
     fig.update_layout(
-        **PLOT_LAYOUT,
         title=f"Predicted: <b>{top}</b>  ({probs[top]*100:.1f}% confidence)",
         xaxis=dict(title="Confidence (%)", range=[0, 118], gridcolor="#373b3e"),
         height=300,

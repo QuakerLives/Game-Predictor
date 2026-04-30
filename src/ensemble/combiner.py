@@ -1,10 +1,13 @@
 """Ensemble combiner: merges softmax probability matrices from all sub-models.
 
-Three combination strategies:
-  - "average"  — equal-weight average of all prob matrices (default)
-  - "weighted" — manually supplied per-model weights (must sum to 1)
-  - "learned"  — fits a non-negative weight vector via scipy.optimize on a
-                  held-out validation set; minimises cross-entropy
+Four combination strategies:
+  - "average"       — equal-weight average of all prob matrices (default)
+  - "weighted"      — manually supplied per-model weights (must sum to 1)
+  - "learned"       — fits a non-negative weight vector via scipy.optimize on a
+                      held-out validation set; minimises cross-entropy
+  - "proportional"  — weights each model by its individual validation accuracy
+                      (weight_i = accuracy_i / sum(accuracies)); simple and
+                      interpretable, prevents any single model from dominating
 
 All sub-models expose ``predict_proba(input) -> (N, C) numpy array``
 before being passed here — the combiner is agnostic to model type.
@@ -20,6 +23,11 @@ Usage
     combiner_opt = EnsembleCombiner(strategy="learned")
     combiner_opt.fit(val_probs_list, y_val)
     test_probs = combiner_opt.combine(test_probs_list)
+
+    # Accuracy-proportional weights
+    combiner_prop = EnsembleCombiner(strategy="proportional")
+    combiner_prop.fit(val_probs_list, y_val)
+    test_probs = combiner_prop.combine(test_probs_list)
 """
 
 from __future__ import annotations
@@ -45,7 +53,7 @@ class EnsembleCombiner:
         strategy: str = "average",
         weights: list[float] | None = None,
     ) -> None:
-        if strategy not in ("average", "weighted", "learned"):
+        if strategy not in ("average", "weighted", "learned", "proportional"):
             raise ValueError(f"Unknown strategy: {strategy!r}")
         self.strategy = strategy
         self.weights = np.array(weights, dtype=np.float64) if weights else None
@@ -57,8 +65,12 @@ class EnsembleCombiner:
         self,
         probs_list: list[np.ndarray],
         y_true: np.ndarray,
+        min_weight: float = 0.15,
     ) -> "EnsembleCombiner":
-        """Fit non-negative weights by minimising cross-entropy on ``y_true``.
+        """Fit weights by minimising cross-entropy on ``y_true``.
+
+        Each model is guaranteed at least ``min_weight`` so the ensemble
+        remains genuinely multi-modal rather than collapsing to a single model.
 
         Only meaningful when ``strategy == "learned"``.  Calling fit with
         any other strategy is a no-op (weights are ignored during combine).
@@ -66,16 +78,34 @@ class EnsembleCombiner:
         Args:
             probs_list: List of (N, C) probability arrays from each model.
             y_true: Ground-truth integer labels of length N.
+            min_weight: Floor for each model's weight (default 0.15).
+                        Must satisfy ``n_models * min_weight <= 1``.
         """
-        if self.strategy != "learned":
+        if self.strategy not in ("learned", "proportional"):
+            return self
+
+        if self.strategy == "proportional":
+            accs = np.array([
+                accuracy_score(y_true, p.argmax(axis=1)) for p in probs_list
+            ])
+            self._fitted_weights = accs / accs.sum()
+            print(
+                "[ensemble] proportional weights: "
+                + "  ".join(f"model{i+1}={w:.4f}" for i, w in enumerate(self._fitted_weights))
+            )
             return self
 
         n_models = len(probs_list)
         stacked = np.stack(probs_list, axis=0)  # (M, N, C)
 
+        # Optimise in unconstrained space, then project onto the simplex with floor.
         def _neg_log_likelihood(w: np.ndarray) -> float:
-            w_norm = np.exp(w) / np.exp(w).sum()           # softmax → sums to 1
-            avg = (stacked * w_norm[:, None, None]).sum(0)  # (N, C)
+            # softmax keeps weights positive and summing to 1
+            w_norm = np.exp(w) / np.exp(w).sum()
+            # enforce floor: redistribute excess from clamped models
+            w_floored = np.clip(w_norm, min_weight, 1.0)
+            w_floored /= w_floored.sum()
+            avg = (stacked * w_floored[:, None, None]).sum(0)  # (N, C)
             avg = np.clip(avg, 1e-12, 1.0)
             avg /= avg.sum(axis=1, keepdims=True)
             return log_loss(y_true, avg)
@@ -85,8 +115,9 @@ class EnsembleCombiner:
             x0=np.zeros(n_models),
             method="L-BFGS-B",
         )
-        raw = result.x
-        self._fitted_weights = np.exp(raw) / np.exp(raw).sum()
+        raw_norm = np.exp(result.x) / np.exp(result.x).sum()
+        floored = np.clip(raw_norm, min_weight, 1.0)
+        self._fitted_weights = floored / floored.sum()
         print(
             "[ensemble] learned weights: "
             + "  ".join(f"model{i+1}={w:.4f}" for i, w in enumerate(self._fitted_weights))
@@ -112,9 +143,9 @@ class EnsembleCombiner:
             w = self.weights / self.weights.sum()
             return (stacked * w[:, None, None]).sum(axis=0)
 
-        # strategy == "learned"
+        # strategy == "learned" or "proportional"
         if self._fitted_weights is None:
-            raise RuntimeError("Call fit() before combine() with strategy='learned'")
+            raise RuntimeError(f"Call fit() before combine() with strategy={self.strategy!r}")
         w = self._fitted_weights
         return (stacked * w[:, None, None]).sum(axis=0)
 
@@ -164,11 +195,11 @@ class EnsembleCombiner:
             print(f"  Model {i + 1:<21d} {acc:>10.4f} {ll:>10.4f}")
 
         print()
-        for strategy in ("average", "weighted", "learned"):
+        for strategy in ("average", "weighted", "learned", "proportional"):
             c = EnsembleCombiner(strategy=strategy)
             if strategy == "weighted":
                 c.weights = np.ones(n_models) / n_models
-            if strategy == "learned":
+            if strategy in ("learned", "proportional"):
                 c.fit(probs_list, y_true)
             result = c.evaluate(probs_list, y_true, label_names)
             print(

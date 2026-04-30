@@ -391,6 +391,7 @@ def build_dataset_from_gameplay(
     # Embed all narrations up-front (encoder is pretrained — no train/test leakage)
     print(f"[nn-gameplay] encoding narrations with {embed_model} ...")
     from sentence_transformers import SentenceTransformer
+    import transformers as _hf; _hf.logging.set_verbosity_error()
     encoder = SentenceTransformer(embed_model)
     X_emb = encoder.encode(texts, batch_size=embed_batch_size, show_progress_bar=True).astype(np.float64)
     print(f"[nn-gameplay] embedding dim: {X_emb.shape[1]}")
@@ -450,18 +451,20 @@ def build_dataset_from_gameplay(
     # Impute NaNs on numerical features (train-fit only; embeddings and Steam are clean)
     X_num_tr, X_num_va, X_num_te, _ = impute(X_num_tr, X_num_va, X_num_te)
 
-    # Combine: [6 metadata | 384-dim embedding | 7 Steam features]
-    X_tr = np.hstack([X_num_tr, X_emb_tr, X_steam_tr])
-    X_va = np.hstack([X_num_va, X_emb_va, X_steam_va])
-    X_te = np.hstack([X_num_te, X_emb_te, X_steam_te])
+    # Combine: [6 metadata | 384-dim embedding]
+    # Steam aggregate features are excluded: they are constant per game and
+    # trivially identify the label, which collapses the model to a lookup table
+    # and makes the ensemble redundant.
+    X_tr = np.hstack([X_num_tr, X_emb_tr])
+    X_va = np.hstack([X_num_va, X_emb_va])
+    X_te = np.hstack([X_num_te, X_emb_te])
     feature_names = (
         num_feature_names
         + [f"emb_{i}" for i in range(X_emb.shape[1])]
-        + _STEAM_FEATURE_NAMES
     )
     print(
         f"[nn-gameplay] feature dim: {X_tr.shape[1]} "
-        f"(6 metadata + {X_emb.shape[1]} embedding + {len(_STEAM_FEATURE_NAMES)} Steam)"
+        f"(6 metadata + {X_emb.shape[1]} embedding; Steam features excluded)"
     )
 
     # Standardize the full feature matrix (train-fit only)

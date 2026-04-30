@@ -352,21 +352,26 @@ def build_live_demo_tab() -> dbc.Container:
 
 _CARD_1_BODY = (
     "An agentic pipeline searched Google/Bing Images and YouTube for gameplay "
-    "screenshots across five games. Every candidate image was processed by "
-    "ministral-3:14b for three tasks: "
-    "(a) image validation -- rejecting ads, menus, and off-topic content; "
+    "screenshots across five games. The primary collection run used gemma4:26b "
+    "(Gemma 4, 26B parameters, served locally via Ollama) for three tasks:\n"
+    "(a) image validation -- rejecting ads, menus, and off-topic content;\n"
     "(b) narration generation -- a text description of the game state written "
-    "independently of the image so it functions as a text feature for the NN/Transformer; "
+    "independently of the image so it functions as a text feature for the Transformer;\n"
     "(c) experience-level classification -- rating visible player skill as "
-    "Poor / Fair / Good / Excellent / Superior."
+    "Poor / Fair / Good / Excellent / Superior.\n\n"
+    "A supplementary collection pass used ministral3:14b (Mistral 14B, fits fully "
+    "in 12 GB VRAM) to scale up record volume on additional hardware, with the same "
+    "prompt templates and validation logic."
 )
 
 _CARD_2_BODY = (
-    "A second offline pass used gemma4:26b to fill fields left empty during "
-    "collection: player_name, gameplay_timestamp, channel_description, "
+    "A second offline enrichment pass used ministral3:14b to fill fields left empty "
+    "during collection: player_name, gameplay_timestamp, channel_description, "
     "player_experience_narration, and identifying_quotes. Records were loaded "
     "in batches of five and each field updated only when the model returned a "
-    "non-sentinel value, preserving any data already collected."
+    "non-sentinel value, preserving any data already collected.\n\n"
+    "Earlier enrichment runs also used gemma4:26b; the final dataset reflects "
+    "contributions from both models across multiple enrichment passes."
 )
 
 _CARD_3_BODY = (
@@ -387,11 +392,13 @@ _CARD_4_BODY = (
     "Three independent classifiers trained on the same 70/15/15 stratified split:\n"
     "- CNN: EfficientNet-B0 fine-tuned on 224x224 screenshots\n"
     "  (Phase 1: frozen backbone warm-up; Phase 2: full fine-tune + early stopping).\n"
-    "- NN: Fully-connected network on TF-IDF narration features (top-100 terms,\n"
-    "  fitted on training split only) plus six metadata signals.\n"
-    "- Transformer: SentenceTransformer (all-MiniLM-L6-v2) embeds narration text\n"
-    "  into 384-dim vectors fed to the same FC classifier architecture.\n"
-    "Final predictions combine all three via averaged softmax probabilities (ensemble)."
+    "- NN: Fully-connected network on numerical gameplay features joined from\n"
+    "  gameplay_records (experience level, source type) and Steam API aggregate\n"
+    "  statistics (achievement count, mean completion rate, player count).\n"
+    "- Transformer: SentenceTransformer (all-MiniLM-L6-v2) embeds sanitized\n"
+    "  narration text into 384-dim vectors fed to the same FC classifier architecture.\n"
+    "Final predictions combine all three via a learned weighting strategy that\n"
+    "minimises cross-entropy on the validation set (L-BFGS-B optimisation)."
 )
 
 

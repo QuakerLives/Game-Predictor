@@ -398,10 +398,132 @@ def run_eval(db_path: str | Path = "data/steam_data.duckdb") -> None:
     print()
 
 
+def _load_npz(name: str) -> tuple[np.ndarray, np.ndarray, list[str]] | None:
+    from pathlib import Path
+    path = Path("models") / f"{name}_test.npz"
+    if not path.exists():
+        return None
+    d = np.load(path, allow_pickle=True)
+    return d["probs"].astype(np.float64), d["y_true"].astype(np.int64), list(d["label_names"])
+
+
+def _npz_section(num: int, title: str, probs: np.ndarray, y_true: np.ndarray, labels: list[str]) -> None:
+    from sklearn.metrics import classification_report, confusion_matrix, top_k_accuracy_score
+    preds = probs.argmax(axis=1)
+    acc   = float((preds == y_true).mean())
+    safe  = np.clip(probs, 1e-12, 1.0); safe /= safe.sum(axis=1, keepdims=True)
+    ll    = log_loss(y_true, safe)
+    top2  = top_k_accuracy_score(y_true, probs, k=min(2, len(labels)), labels=list(range(len(labels))))
+
+    print(_hdr(f"{num}. {title}"))
+    print(_row(f"Test samples ............ {len(y_true)}"))
+    print(_row(f"Accuracy ................ {acc:.4f}"))
+    print(_row(f"Log-loss ................ {ll:.4f}"))
+    print(_row(f"Top-2 accuracy .......... {top2:.4f}"))
+    print(_row())
+
+    print(_row(f"  {'Class':<28s} {'Acc':>6s}  Bar"))
+    print(_row(f"  {'─'*28} {'─'*6}  {'─'*22}"))
+    for i, cname in enumerate(labels):
+        mask = y_true == i
+        if not mask.any():
+            continue
+        ca = float((preds[mask] == y_true[mask]).mean())
+        print(_row(f"  {cname:<28s} {ca:>6.4f}  {_bar(ca, 20)}"))
+    print(_row())
+
+    cm = confusion_matrix(y_true, preds)
+    abbrevs = [lb[:7] for lb in labels]
+    cw = max(8, max(len(a) for a in abbrevs) + 1)
+    print(_row("Confusion matrix (rows=true, cols=predicted):"))
+    print(_row(" " * 12 + "".join(f"{a:>{cw}}" for a in abbrevs)))
+    print(_row(" " * 12 + "─" * (cw * len(labels))))
+    for i, ab in enumerate(abbrevs):
+        print(_row(f"  {ab:<10s}" + "".join(f"{cm[i,j]:>{cw}d}" for j in range(len(labels)))))
+    print(_row())
+
+    for line in classification_report(y_true, preds, target_names=labels, digits=4, zero_division=0).splitlines():
+        print(_row(line))
+    print(_bot())
+    print()
+
+
+def run_all_models(db_path: str = "data/steam_data.duckdb") -> None:
+    """Full evaluation: Steam NN pipeline + CNN + Transformer + Ensemble."""
+    from ensemble.combiner import EnsembleCombiner
+
+    # Steam NN (trains from scratch, sections 1-15)
+    run_eval(db_path)
+
+    # Load saved outputs from the other models
+    cnn_r   = _load_npz("cnn")
+    trans_r = _load_npz("transformer")
+    nn_r    = _load_npz("nn")
+
+    if cnn_r is None or trans_r is None:
+        print("  Skipping CNN/Transformer/Ensemble sections — run game_cnn and game_transformer first.")
+        return
+
+    cnn_probs,   cnn_y,   labels = cnn_r
+    trans_probs, trans_y, _      = trans_r
+
+    probs_list  = [cnn_probs, trans_probs]
+    model_names = ["CNN (EfficientNet-B0)", "Transformer (all-MiniLM-L6-v2)"]
+
+    if nn_r is not None and len(nn_r[1]) == len(cnn_y):
+        probs_list.append(nn_r[0])
+        model_names.append("NN (gameplay features)")
+
+    y_true = cnn_y
+    sec = 16
+
+    _npz_section(sec,     "CNN (EfficientNet-B0)",          cnn_probs,   y_true, labels); sec += 1
+    _npz_section(sec,     "Transformer (all-MiniLM-L6-v2)", trans_probs, y_true, labels); sec += 1
+    if len(probs_list) == 3:
+        _npz_section(sec, "NN (gameplay features)",         probs_list[2], y_true, labels); sec += 1
+
+    # Ensemble comparison
+    n = len(probs_list)
+    print(_hdr(f"{sec}. Ensemble Comparison"))
+    print(_row(f"  {'Strategy':<30s} {'Accuracy':>10s} {'Log-Loss':>10s}"))
+    print(_row(f"  {'─'*30} {'─'*10} {'─'*10}"))
+    best_acc, best_result, best_name, best_weights = 0.0, None, "", None
+    for strategy in ("average", "weighted", "learned"):
+        c = EnsembleCombiner(strategy=strategy)
+        if strategy == "weighted":
+            c.weights = np.ones(n) / n
+        if strategy == "learned":
+            c.fit(probs_list, y_true)
+        r = c.evaluate(probs_list, y_true, labels)
+        print(_row(f"  {strategy.capitalize():<30s} {r['accuracy']:>10.4f} {r['log_loss']:>10.4f}"))
+        if r["accuracy"] >= best_acc:
+            best_acc, best_result, best_name = r["accuracy"], r, strategy
+            if strategy == "learned":
+                best_weights = c._fitted_weights
+    print(_bot()); print(); sec += 1
+
+    print(_hdr(f"{sec}. Best Ensemble — {best_name.capitalize()} Weights"))
+    if best_weights is not None:
+        for mname, w in zip(model_names, best_weights):
+            print(_row(f"  {mname:<36s} weight={w:.4f}  {_bar(float(w), 18)}"))
+        print(_row())
+    print(_row(f"Accuracy ................ {best_result['accuracy']:.4f}"))
+    print(_row(f"Log-loss ................ {best_result['log_loss']:.4f}"))
+    print(_row())
+    for cname, acc in best_result["per_class"].items():
+        print(_row(f"  {cname:<28s} {acc:.4f}  {_bar(acc, 20)}"))
+    print(_bot()); print()
+
+
 if __name__ == "__main__":
     import argparse
 
     p = argparse.ArgumentParser(description="Game-NN evaluation report")
     p.add_argument("--db", default="data/steam_data.duckdb", help="Path to DuckDB file")
+    p.add_argument("--all", action="store_true", help="Also evaluate CNN, Transformer, and Ensemble")
     args = p.parse_args()
-    run_eval(args.db)
+
+    if args.all:
+        run_all_models(args.db)
+    else:
+        run_eval(args.db)

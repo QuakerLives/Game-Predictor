@@ -223,6 +223,5 @@ sleeper.log
 .skip_*
 
 # ML pipeline artifacts (large binaries / generated output)
-models/
 reports/
 data/

@@ -180,6 +180,7 @@ def build_dataset(
 
     # 2. Encode with SentenceTransformer
     print(f"[transformer] encoding with {embed_model} ...")
+    import transformers as _hf; _hf.logging.set_verbosity_error()
     encoder = SentenceTransformer(embed_model)
     X = encoder.encode(texts, batch_size=batch_size, show_progress_bar=True)
     X = X.astype(np.float64)

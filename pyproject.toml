@@ -48,6 +48,7 @@ game-nn-train = "game_nn.pipeline:run"
 game-cnn-train = "game_cnn.pipeline:run"
 game-transformer-train = "game_transformer.pipeline:run"
 game-ensemble = "ensemble.run:run"
+game-eval = "game_nn.eval:run_all_models"
 game-dashboard = "dashboard.app:main"
 
 [build-system]

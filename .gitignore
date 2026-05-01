@@ -225,3 +225,7 @@ sleeper.log
 # ML pipeline artifacts (large binaries / generated output)
 reports/
 data/
+old/
+old_data/
+*.png
+.DS_Store

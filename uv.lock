@@ -722,6 +722,11 @@ notebooks = [
     { name = "seaborn" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "game-predictor" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "aiofiles", specifier = ">=24.1.0" },
@@ -752,6 +757,9 @@ requires-dist = [
     { name = "torchvision", specifier = ">=0.17.0" },
 ]
 provides-extras = ["notebooks"]
+
+[package.metadata.requires-dev]
+dev = [{ name = "game-predictor", editable = "." }]
 
 [[package]]
 name = "greenlet"

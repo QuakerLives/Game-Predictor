@@ -60,3 +60,17 @@ packages = ["src/game_predictor", "src/game_nn", "src/game_cnn", "src/game_trans
 
 [tool.uv]
 torch-backend = "cu124"
+
+[tool.uv.workspace]
+members = [
+    ".",
+    ".",
+]
+
+[tool.uv.sources]
+game-predictor = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "game-predictor",
+]

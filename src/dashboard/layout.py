@@ -352,26 +352,28 @@ def build_live_demo_tab() -> dbc.Container:
 
 _CARD_1_BODY = (
     "An agentic pipeline searched Google/Bing Images and YouTube for gameplay "
-    "screenshots across five games. The primary collection run used gemma4:26b "
-    "(Gemma 4, 26B parameters, served locally via Ollama) for three tasks:\n"
-    "(a) image validation -- rejecting ads, menus, and off-topic content;\n"
+    "screenshots across five games. Every candidate image was processed by "
+    "the serving LLM for three tasks: "
+    "(a) image validation -- rejecting ads, menus, and off-topic content; "
     "(b) narration generation -- a text description of the game state written "
-    "independently of the image so it functions as a text feature for the Transformer;\n"
+    "independently of the image so it functions as a text feature for the Transformer; "
     "(c) experience-level classification -- rating visible player skill as "
     "Poor / Fair / Good / Excellent / Superior.\n\n"
-    "A supplementary collection pass used ministral3:14b (Mistral 14B, fits fully "
-    "in 12 GB VRAM) to scale up record volume on additional hardware, with the same "
-    "prompt templates and validation logic."
+    "Pass 1 used gemma4:26b (Gemma 4, 26B parameters, served locally via Ollama) "
+    "for both data collection and enrichment.\n"
+    "Pass 2 used ministral3:14b (Mistral 14B, served locally via Ollama) "
+    "for both data collection and enrichment, with the same prompt templates "
+    "and validation logic."
 )
 
 _CARD_2_BODY = (
-    "A second offline enrichment pass used ministral3:14b to fill fields left empty "
+    "Each pass included an offline enrichment phase to fill fields left empty "
     "during collection: player_name, gameplay_timestamp, channel_description, "
     "player_experience_narration, and identifying_quotes. Records were loaded "
     "in batches of five and each field updated only when the model returned a "
     "non-sentinel value, preserving any data already collected.\n\n"
-    "Earlier enrichment runs also used gemma4:26b; the final dataset reflects "
-    "contributions from both models across multiple enrichment passes."
+    "The final dataset reflects contributions from both models across their "
+    "respective collection and enrichment passes."
 )
 
 _CARD_3_BODY = (
@@ -398,7 +400,7 @@ _CARD_4_BODY = (
     "- Transformer: SentenceTransformer (all-MiniLM-L6-v2) embeds sanitized\n"
     "  narration text into 384-dim vectors fed to the same FC classifier architecture.\n"
     "Final predictions combine all three via a learned weighting strategy that\n"
-    "minimises cross-entropy on the validation set (L-BFGS-B optimisation)."
+    "minimizes cross-entropy on the validation set (L-BFGS-B optimization)."
 )
 
 
@@ -424,8 +426,8 @@ def build_methodology_tab() -> dbc.Container:
         dbc.Row([
             dbc.Col([
                 html.H4("How AI Was Used in This Project", className="mt-3 mb-3"),
-                _method_card("1  Data Collection - ministral-3:14b via Ollama", _CARD_1_BODY),
-                _method_card("2  Enrichment Pass - gemma4:26b",                 _CARD_2_BODY),
+                _method_card("1  Data Collection - gemma4:26b & ministral3:14b via Ollama", _CARD_1_BODY),
+                _method_card("2  Enrichment Passes - gemma4:26b & ministral3:14b",       _CARD_2_BODY),
                 _method_card("3  Validating AI Correctness",                    _CARD_3_BODY),
                 _method_card("4  Model Architectures",                          _CARD_4_BODY),
                 html.H5("Sample AI-Generated Narrations from the Dataset",

@@ -488,17 +488,17 @@ def run_all_models(db_path: str = "data/steam_data.duckdb") -> None:
     print(_row(f"  {'Strategy':<30s} {'Accuracy':>10s} {'Log-Loss':>10s}"))
     print(_row(f"  {'─'*30} {'─'*10} {'─'*10}"))
     best_acc, best_result, best_name, best_weights = 0.0, None, "", None
-    for strategy in ("average", "weighted", "learned"):
+    for strategy in ("average", "weighted", "learned", "proportional"):
         c = EnsembleCombiner(strategy=strategy)
         if strategy == "weighted":
             c.weights = np.ones(n) / n
-        if strategy == "learned":
+        if strategy in ("learned", "proportional"):
             c.fit(probs_list, y_true)
         r = c.evaluate(probs_list, y_true, labels)
         print(_row(f"  {strategy.capitalize():<30s} {r['accuracy']:>10.4f} {r['log_loss']:>10.4f}"))
         if r["accuracy"] >= best_acc:
             best_acc, best_result, best_name = r["accuracy"], r, strategy
-            if strategy == "learned":
+            if strategy in ("learned", "proportional"):
                 best_weights = c._fitted_weights
     print(_bot()); print(); sec += 1
 

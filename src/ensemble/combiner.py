@@ -38,6 +38,28 @@ from sklearn.metrics import accuracy_score, log_loss
 from sklearn.preprocessing import label_binarize
 
 
+def _project_floor(w: np.ndarray, floor: float) -> np.ndarray:
+    """Project w onto the probability simplex with per-element lower bound `floor`.
+
+    Simple iterative algorithm: clamp below-floor weights to floor, redistribute
+    the excess uniformly away from already-clamped weights, repeat until stable.
+    """
+    w = w.astype(np.float64).copy()
+    for _ in range(1000):
+        below = w < floor
+        if not below.any():
+            break
+        w[below] = floor
+        excess = w.sum() - 1.0
+        above = ~below
+        if above.any():
+            w[above] -= excess * (w[above] / w[above].sum())
+        else:
+            w = np.ones(len(w)) / len(w)
+            break
+    return w / w.sum()
+
+
 class EnsembleCombiner:
     """Combine probability outputs from multiple classifiers.
 
@@ -116,8 +138,7 @@ class EnsembleCombiner:
             method="L-BFGS-B",
         )
         raw_norm = np.exp(result.x) / np.exp(result.x).sum()
-        floored = np.clip(raw_norm, min_weight, 1.0)
-        self._fitted_weights = floored / floored.sum()
+        self._fitted_weights = _project_floor(raw_norm, min_weight)
         print(
             "[ensemble] learned weights: "
             + "  ".join(f"model{i+1}={w:.4f}" for i, w in enumerate(self._fitted_weights))

@@ -223,7 +223,11 @@ _cnn_labels: "list[str] | None" = None
 
 
 def get_cnn_model() -> tuple:
-    """Lazy-load the trained CNN weights. Returns (model, label_names) or (None, None)."""
+    """Lazy-load the trained CNN weights. Returns (model, label_names) or (None, None).
+
+    Models are loaded on first use rather than at import time — the CNN checkpoint
+    alone is ~20MB and loading all three at startup would slow the initial page load.
+    """
     global _cnn_model, _cnn_labels
     if _cnn_model is not None:
         return _cnn_model, _cnn_labels
@@ -261,6 +265,7 @@ def predict_from_b64(image_b64: str) -> dict[str, float]:
         transforms.Normalize(_IMAGENET_MEAN, _IMAGENET_STD),
     ])
 
+    # dcc.Upload sends "data:image/png;base64,<data>" — split off the header first
     _, data = image_b64.split(",", 1)
     img     = Image.open(io.BytesIO(base64.b64decode(data))).convert("RGB")
     tensor  = cnn_transform(img).unsqueeze(0)
@@ -377,7 +382,8 @@ def get_nn_model() -> tuple:
     with open(scaler_path, "rb") as f:
         scaler = pickle.load(f)
 
-    # Reuse transformer encoder if already loaded, otherwise load fresh
+    # Both models use the same encoder — reuse the already-loaded instance to
+    # avoid loading a second 90MB model into memory
     encoder = _trans_encoder or SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
     _nn_model, _nn_labels = model, list(ckpt["label_names"])
@@ -407,6 +413,8 @@ def predict_from_gameplay_features(
 
     exp_enc = _EXP_LEVEL_MAP.get(experience_level, 2.0)     # default "Good"
     is_yt   = 1.0 if source_type == "youtube" else 0.0
+    # Feature order must exactly match build_dataset_from_gameplay in game_nn/data.py —
+    # the scaler was fit on [exp, is_yt, has_player_name, has_timestamp, has_channel_desc, narr_len]
     meta    = np.array([[
         exp_enc, is_yt,
         1.0 if has_player_name  else 0.0,

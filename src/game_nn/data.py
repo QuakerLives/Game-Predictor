@@ -107,6 +107,8 @@ SELECT
     video_game_name,
     experience_level,
     source_type,
+    -- Use presence/absence flags rather than raw content.
+    -- channel_description often names the game directly, so treating it as text would leak the label.
     CASE WHEN player_name          IS NOT NULL THEN 1.0 ELSE 0.0 END AS has_player_name,
     CASE WHEN gameplay_timestamp   IS NOT NULL THEN 1.0 ELSE 0.0 END AS has_timestamp,
     CASE WHEN channel_description  IS NOT NULL THEN 1.0 ELSE 0.0 END AS has_channel_desc,
@@ -116,8 +118,9 @@ FROM gameplay_records
 ORDER BY id
 """
 
-# gameplay_level (97% NULL) and total_playtime (95% NULL) were removed — after median
-# imputation they become constants with zero variance and add no signal.
+# gameplay_level and total_playtime were removed — ~87% of non-null gameplay_level
+# values are the sentinel -1, and total_playtime is almost always 150 (a default cap).
+# After median imputation both collapse to a single value with near-zero variance.
 
 _FEATURE_QUERY = """
 WITH ranked_ach AS (
@@ -303,6 +306,8 @@ def build_dataset(
     X_tr, X_va, X_te, _ = standardize(X_tr, X_va, X_te)
 
     # 4. PCA (train-fit only)
+    # Only 4 Steam features, so PCA retains all variance but decorrelates them.
+    # The main benefit is removing any redundancy between correlated achievement stats.
     n_comp = pca_components or min(X_tr.shape[1], X_tr.shape[0])
     X_tr, X_va, X_te, pca = apply_pca(X_tr, X_va, X_te, n_components=n_comp)
     print(
@@ -311,10 +316,13 @@ def build_dataset(
     )
 
     # 5. K-Means cluster feature (train-fit only)
+    # Appends a cluster label as an extra feature — acts as a rough "game fingerprint"
+    # learned from the spatial structure of the feature space
     X_tr, X_va, X_te, _ = apply_kmeans(X_tr, X_va, X_te, n_clusters=n_clusters)
     print(f"[data] K-Means {n_clusters} clusters → feature dim now {X_tr.shape[1]}")
 
-    # 6. Oversample training set ONLY
+    # 6. Oversample training set ONLY — val/test stay at natural distribution
+    # so evaluation reflects real-world class balance
     pre_resample = len(y_tr)
     X_tr, y_tr = resample_training(X_tr, y_tr, seed=seed)
     print(f"[data] resample  {pre_resample} → {len(y_tr)} training samples")
@@ -351,8 +359,10 @@ def build_dataset_from_gameplay(
     a game-profile fingerprint from an external source without dominating, since
     they are 7 values out of 397 total input dimensions.
 
-    gameplay_level and total_playtime were dropped (97%/95% NULL → zero-variance
-    constants after median imputation, no signal).
+    gameplay_level and total_playtime were dropped — ~87% of non-null gameplay_level
+    values are the sentinel -1, and total_playtime is almost always 150 (a default
+    cap). Both collapse to near-zero variance after median imputation, so they add
+    no discriminating signal.
 
     When *test_record_ids* is provided (from models/shared_split.npz), those
     records form the test set so the NN aligns with the CNN and Transformer.
@@ -452,9 +462,10 @@ def build_dataset_from_gameplay(
     X_num_tr, X_num_va, X_num_te, _ = impute(X_num_tr, X_num_va, X_num_te)
 
     # Combine: [6 metadata | 384-dim embedding]
-    # Steam aggregate features are excluded: they are constant per game and
-    # trivially identify the label, which collapses the model to a lookup table
-    # and makes the ensemble redundant.
+    # Steam features are deliberately excluded here even though they're available.
+    # They're constants per game, so including them would trivially predict the label
+    # and make this model redundant with a simple lookup — the ensemble needs three
+    # genuinely different signals.
     X_tr = np.hstack([X_num_tr, X_emb_tr])
     X_va = np.hstack([X_num_va, X_emb_va])
     X_te = np.hstack([X_num_te, X_emb_te])

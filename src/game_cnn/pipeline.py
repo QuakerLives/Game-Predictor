@@ -31,7 +31,12 @@ def _run_epoch(
     optimizer: torch.optim.Optimizer | None,
     device: torch.device,
 ) -> tuple[float, float]:
-    """Run one pass.  If optimizer is None, run in eval mode (no gradients)."""
+    """Run one forward pass over the loader.
+
+    If optimizer is None the function runs in eval mode with no gradient
+    computation — used for validation and test passes.
+    Returns (avg_loss, accuracy) for the epoch.
+    """
     training = optimizer is not None
     model.train(training)
 
@@ -39,6 +44,7 @@ def _run_epoch(
     correct = 0
     n = 0
 
+    # Use enable_grad only during training — no_grad speeds up val/test passes
     ctx = torch.enable_grad() if training else torch.no_grad()
     with ctx:
         for images, labels in loader:
@@ -52,6 +58,7 @@ def _run_epoch(
                 loss.backward()
                 optimizer.step()
 
+            # Accumulate weighted by batch size since last batch may be smaller
             total_loss += loss.item() * len(labels)
             correct += (logits.argmax(1) == labels).sum().item()
             n += len(labels)
@@ -88,11 +95,15 @@ def train_single_model(
     if verbose:
         print(f"  device: {device}")
 
+    # Start with backbone frozen — only the new classifier head is trainable
     model = GameCNN(bundle.n_classes, dropout=dropout, freeze_backbone=True)
     model.to(device)
     criterion = nn.CrossEntropyLoss()
 
     # ── Phase 1: head warm-up ────────────────────────────────────────────────
+    # Train only the new classifier head before touching the backbone.
+    # Without this, large random gradients from the untrained head can corrupt
+    # the pretrained feature extractor in the first few batches.
     if warmup_epochs > 0:
         head_params = [p for p in model.parameters() if p.requires_grad]
         opt_warmup = torch.optim.Adam(head_params, lr=warmup_lr)
@@ -106,10 +117,13 @@ def train_single_model(
                 )
 
     # ── Phase 2: full fine-tune ──────────────────────────────────────────────
+    # Unfreeze backbone and continue with a much lower LR so we gently adjust
+    # the pretrained representations rather than overwriting them
     model.unfreeze_backbone()
     optimizer = torch.optim.Adam(
         model.parameters(), lr=lr, weight_decay=weight_decay,
     )
+    # Halve the LR if val loss stalls for 3 epochs — helps get through plateaus
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", patience=3, factor=0.5,
     )
@@ -123,6 +137,7 @@ def train_single_model(
         va_loss, va_acc = _run_epoch(model, bundle.val, criterion, None, device)
         scheduler.step(va_loss)
 
+        # Track the best val accuracy and save that checkpoint
         if va_acc > best_val_acc:
             best_val_acc = va_acc
             best_state = copy.deepcopy(model.state_dict())
@@ -141,6 +156,8 @@ def train_single_model(
                 print(f"  early stop at epoch {epoch}")
             break
 
+    # Restore the checkpoint from the epoch with the best val accuracy,
+    # not the final epoch (which may have already started to overfit)
     model.load_state_dict(best_state)  # type: ignore[arg-type]
     return model, {"best_val_acc": best_val_acc}
 
@@ -154,7 +171,8 @@ def evaluate(
 ) -> dict:
     """Evaluate a single model on test or val split.
 
-    Returns accuracy, per-class accuracy, and a numpy array of probabilities.
+    Returns accuracy, per-class accuracy, and a numpy array of softmax
+    probabilities shaped (N, n_classes).
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -163,6 +181,7 @@ def evaluate(
     model.to(device)
     model.eval()
 
+    # Collect probs and labels batch by batch, then concatenate
     all_probs: list[torch.Tensor] = []
     all_labels: list[torch.Tensor] = []
 
@@ -172,11 +191,12 @@ def evaluate(
             all_probs.append(probs.cpu())
             all_labels.append(labels)
 
-    probs_t = torch.cat(all_probs)
+    probs_t  = torch.cat(all_probs)
     labels_t = torch.cat(all_labels)
-    preds = probs_t.argmax(1)
-    acc = (preds == labels_t).float().mean().item()
+    preds    = probs_t.argmax(1)
+    acc      = (preds == labels_t).float().mean().item()
 
+    # Per-class accuracy — useful for spotting which games are hardest to classify
     per_class: dict[str, float] = {}
     for i, name in enumerate(bundle.label_names):
         mask = labels_t == i
@@ -208,16 +228,18 @@ def ensemble_evaluate(
             for images, labels in bundle.test:
                 probs = model.predict_proba(images.to(device))
                 member_probs.append(probs.cpu())
+                # Only collect labels once — they're the same for every model
                 if not labels_collected:
                     all_labels.append(labels)
 
         labels_collected = True
         all_member_probs.append(torch.cat(member_probs))
 
-    labels_t = torch.cat(all_labels)
+    labels_t  = torch.cat(all_labels)
+    # Stack along a new model dimension and average across it
     avg_probs = torch.stack(all_member_probs).mean(dim=0)
-    preds = avg_probs.argmax(1)
-    acc = (preds == labels_t).float().mean().item()
+    preds     = avg_probs.argmax(1)
+    acc       = (preds == labels_t).float().mean().item()
 
     per_class: dict[str, float] = {}
     for i, name in enumerate(bundle.label_names):
@@ -235,7 +257,7 @@ def run(
     warmup_epochs: int = 5,
     epochs: int = 30,
 ) -> None:
-    """Full pipeline: load data → train CNN → evaluate."""
+    """Full pipeline: load data → train CNN → evaluate → save outputs."""
     print("=" * 60)
     print("  Game-CNN  ·  EfficientNet-B0 Training Pipeline")
     print("=" * 60)
@@ -272,6 +294,8 @@ def run(
         y_true=result["y_true"],
         label_names=np.array(bundle.label_names),
     )
+    # shared_split.npz pins the test record IDs so the Transformer and NN pipelines
+    # can build their test sets from the exact same rows — required for ensemble combination
     np.savez(
         save_dir / "shared_split.npz",
         test_record_ids=np.array(bundle.test_record_ids),

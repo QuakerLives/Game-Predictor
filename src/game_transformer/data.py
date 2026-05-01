@@ -3,11 +3,12 @@
 Fields used:
   - gameplay_narration (0.0% null) — only field used; always present
 
-Fields excluded:
-  - channel_description (40.4% null) — frequently names the game directly (leakage)
-  - identifying_quotes  (38.2% null) — literally contains game titles (severe leakage)
-  - player_experience_narration (49.0% null, overlaps with gameplay_narration)
-  - gameplay_level / total_playtime (97–98% null, unusable)
+Fields excluded (all leakage risks — null density is no longer the concern):
+  - channel_description (~5% null) — frequently names the game directly (leakage)
+  - identifying_quotes  (~5% null) — literally game titles and review text (severe leakage)
+  - player_experience_narration (~6% null) — describes channel context, names the game
+  - gameplay_level / total_playtime (~12% null each) — 87%+ records hold a -1 or 150
+    sentinel/default value; near-zero variance, no discriminating signal
 
 Before embedding, game-identifying terms are scrubbed from the narration so the
 model must learn gameplay patterns, not just recognize game names in the text.
@@ -46,6 +47,7 @@ _EMBED_MODEL = "all-MiniLM-L6-v2"  # 384-dim, Apache-2.0
 _SCRUB_PATTERNS: list[re.Pattern] = [
     re.compile(p, re.IGNORECASE)
     for p in [
+        # Longest phrases first so multi-word names match before their substrings
         r"apex legends",
         r"no man'?s sky",
         r"the elder scrolls\s+v",
@@ -198,7 +200,8 @@ def build_dataset(
         X_te, y_te = X[te_indices], y[te_indices]
         X_rest, y_rest = X[tr_val_indices], y[tr_val_indices]
 
-        # val drawn from remaining records at val_ratio / (1 - test_ratio)
+        # Recalculate val fraction relative to the remaining (non-test) records.
+        # e.g. val_ratio=0.15, test_ratio=0.15 → adjusted = 0.15 / 0.85 ≈ 0.176
         adjusted_val = val_ratio / (1.0 - test_ratio)
         X_tr, X_va, y_tr, y_va = train_test_split(
             X_rest, y_rest, test_size=adjusted_val, stratify=y_rest, random_state=seed,

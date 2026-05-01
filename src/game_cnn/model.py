@@ -1,11 +1,12 @@
 """EfficientNet-B0 CNN for multi-class game image classification.
 
-The pretrained ImageNet backbone is kept intact; only the final classifier
-head is replaced to match the number of target classes.  This allows fast
-convergence even with the ~200 images-per-class dataset we have.
+We keep the pretrained ImageNet backbone and only replace the final classifier
+head. Retraining from random weights on ~200 images per class would likely
+overfit badly — starting from ImageNet features avoids that.
 
 ``predict_proba`` mirrors the interface of ``game_nn.model.GameClassifier``
-so both models can be plugged into the same ensemble combiner.
+so both models can be plugged into the same ensemble combiner without any
+extra adapter code.
 """
 
 from __future__ import annotations
@@ -33,7 +34,8 @@ class GameCNN(nn.Module):
     ) -> None:
         super().__init__()
         backbone = efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1)
-        in_features: int = backbone.classifier[1].in_features  # 1280
+        in_features: int = backbone.classifier[1].in_features  # 1280 for EfficientNet-B0
+        # Replace the original 1000-class head with one sized for our 5-game problem
         backbone.classifier = nn.Sequential(
             nn.Dropout(p=dropout),
             nn.Linear(in_features, num_classes),
@@ -41,6 +43,7 @@ class GameCNN(nn.Module):
         self.net = backbone
 
         if freeze_backbone:
+            # Freeze only the feature extractor layers, not the new head
             for param in self.net.features.parameters():
                 param.requires_grad = False
 

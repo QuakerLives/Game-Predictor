@@ -41,8 +41,11 @@ from sklearn.preprocessing import label_binarize
 def _project_floor(w: np.ndarray, floor: float) -> np.ndarray:
     """Project w onto the probability simplex with per-element lower bound `floor`.
 
-    Simple iterative algorithm: clamp below-floor weights to floor, redistribute
-    the excess uniformly away from already-clamped weights, repeat until stable.
+    Works iteratively: clamp any weight below the floor up to floor, then
+    redistribute the excess proportionally across the unclamped weights.
+    Repeat until nothing changes. This avoids the optimizer from silently
+    driving one model's weight to zero, which would make the "ensemble" just
+    a single model under the hood.
     """
     w = w.astype(np.float64).copy()
     for _ in range(1000):
@@ -51,10 +54,12 @@ def _project_floor(w: np.ndarray, floor: float) -> np.ndarray:
             break
         w[below] = floor
         excess = w.sum() - 1.0
-        above = ~below
+        above  = ~below
         if above.any():
+            # Take the excess back proportionally from the unclamped weights
             w[above] -= excess * (w[above] / w[above].sum())
         else:
+            # All weights are at the floor — can't redistribute, just normalize
             w = np.ones(len(w)) / len(w)
             break
     return w / w.sum()
@@ -64,7 +69,7 @@ class EnsembleCombiner:
     """Combine probability outputs from multiple classifiers.
 
     Args:
-        strategy: One of ``"average"``, ``"weighted"``, or ``"learned"``.
+        strategy: One of ``"average"``, ``"weighted"``, ``"learned"``, or ``"proportional"``.
         weights: Per-model weights for the ``"weighted"`` strategy.
             Must be a sequence of non-negative floats that sum to 1 and
             match the number of models passed to ``combine``.
@@ -78,7 +83,7 @@ class EnsembleCombiner:
         if strategy not in ("average", "weighted", "learned", "proportional"):
             raise ValueError(f"Unknown strategy: {strategy!r}")
         self.strategy = strategy
-        self.weights = np.array(weights, dtype=np.float64) if weights else None
+        self.weights  = np.array(weights, dtype=np.float64) if weights else None
         self._fitted_weights: np.ndarray | None = None
 
     # ── Fitting ──────────────────────────────────────────────────────────────
@@ -94,8 +99,8 @@ class EnsembleCombiner:
         Each model is guaranteed at least ``min_weight`` so the ensemble
         remains genuinely multi-modal rather than collapsing to a single model.
 
-        Only meaningful when ``strategy == "learned"``.  Calling fit with
-        any other strategy is a no-op (weights are ignored during combine).
+        Only meaningful when ``strategy`` is "learned" or "proportional".
+        Calling fit with any other strategy is a no-op.
 
         Args:
             probs_list: List of (N, C) probability arrays from each model.
@@ -107,6 +112,7 @@ class EnsembleCombiner:
             return self
 
         if self.strategy == "proportional":
+            # Weight each model by its accuracy — simple and easy to explain
             accs = np.array([
                 accuracy_score(y_true, p.argmax(axis=1)) for p in probs_list
             ])
@@ -117,14 +123,17 @@ class EnsembleCombiner:
             )
             return self
 
+        # ── Learned strategy ──────────────────────────────────────────────
         n_models = len(probs_list)
-        stacked = np.stack(probs_list, axis=0)  # (M, N, C)
+        stacked  = np.stack(probs_list, axis=0)  # (M, N, C)
 
-        # Optimise in unconstrained space, then project onto the simplex with floor.
+        # Optimize in unconstrained space (any real vector), then project back
+        # onto the simplex. This sidesteps numerical issues that arise when
+        # scipy tries to enforce constraints while also approaching a boundary.
         def _neg_log_likelihood(w: np.ndarray) -> float:
-            # softmax keeps weights positive and summing to 1
-            w_norm = np.exp(w) / np.exp(w).sum()
-            # enforce floor: redistribute excess from clamped models
+            # Softmax maps the unconstrained vector to weights that are positive and sum to 1
+            w_norm    = np.exp(w) / np.exp(w).sum()
+            # Clip and renormalize to enforce the per-model minimum
             w_floored = np.clip(w_norm, min_weight, 1.0)
             w_floored /= w_floored.sum()
             avg = (stacked * w_floored[:, None, None]).sum(0)  # (N, C)
@@ -137,6 +146,7 @@ class EnsembleCombiner:
             x0=np.zeros(n_models),
             method="L-BFGS-B",
         )
+        # Final projection ensures the stored weights satisfy the floor constraint exactly
         raw_norm = np.exp(result.x) / np.exp(result.x).sum()
         self._fitted_weights = _project_floor(raw_norm, min_weight)
         print(
@@ -156,15 +166,17 @@ class EnsembleCombiner:
         stacked = np.stack(probs_list, axis=0)  # (M, N, C)
 
         if self.strategy == "average":
+            # Equal weights — simplest possible combination
             return stacked.mean(axis=0)
 
         if self.strategy == "weighted":
             if self.weights is None:
                 raise ValueError("Provide weights when using strategy='weighted'")
+            # Normalize in case the user didn't supply weights that sum to exactly 1
             w = self.weights / self.weights.sum()
             return (stacked * w[:, None, None]).sum(axis=0)
 
-        # strategy == "learned" or "proportional"
+        # strategy == "learned" or "proportional" — both use _fitted_weights
         if self._fitted_weights is None:
             raise RuntimeError(f"Call fit() before combine() with strategy={self.strategy!r}")
         w = self._fitted_weights
@@ -180,16 +192,16 @@ class EnsembleCombiner:
     ) -> dict:
         """Combine probs and return accuracy, log-loss, and per-class accuracy."""
         combined = self.combine(probs_list)
-        preds = combined.argmax(axis=1)
+        preds    = combined.argmax(axis=1)
 
-        acc = accuracy_score(y_true, preds)
+        acc  = accuracy_score(y_true, preds)
+        # Clip to avoid log(0) in log_loss, then renormalize to keep it a valid distribution
         safe = np.clip(combined, 1e-12, 1.0)
         safe /= safe.sum(axis=1, keepdims=True)
-        ll = log_loss(y_true, safe)
+        ll   = log_loss(y_true, safe)
 
         per_class: dict[str, float] = {}
-        classes = np.unique(y_true)
-        for cls in classes:
+        for cls in np.unique(y_true):
             mask = y_true == cls
             name = label_names[cls] if label_names else str(cls)
             per_class[name] = accuracy_score(y_true[mask], preds[mask])
@@ -202,20 +214,22 @@ class EnsembleCombiner:
         y_true: np.ndarray,
         label_names: list[str] | None = None,
     ) -> None:
-        """Print a comparison table: individual models vs. all three strategies."""
+        """Print a comparison table: individual models vs. all four strategies."""
         n_models = len(probs_list)
         print(f"\n{'Model/Strategy':<28s} {'Accuracy':>10s} {'Log-Loss':>10s}")
         print("-" * 52)
 
+        # Individual model baselines first
         for i, probs in enumerate(probs_list):
             preds = probs.argmax(axis=1)
-            acc = accuracy_score(y_true, preds)
-            safe = np.clip(probs, 1e-12, 1.0)
+            acc   = accuracy_score(y_true, preds)
+            safe  = np.clip(probs, 1e-12, 1.0)
             safe /= safe.sum(axis=1, keepdims=True)
-            ll = log_loss(y_true, safe)
+            ll    = log_loss(y_true, safe)
             print(f"  Model {i + 1:<21d} {acc:>10.4f} {ll:>10.4f}")
 
         print()
+        # Then all four combination strategies
         for strategy in ("average", "weighted", "learned", "proportional"):
             c = EnsembleCombiner(strategy=strategy)
             if strategy == "weighted":

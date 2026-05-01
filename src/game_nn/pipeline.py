@@ -27,7 +27,7 @@ def train_single_model(
     weight_decay: float = 1e-4,
     epochs: int = 300,
     batch_size: int = 32,
-    patience: int = 40,
+    patience: int = 40,  # higher than CNN — embedding features train more slowly
     seed: int = 42,
     verbose: bool = True,
 ) -> tuple[GameClassifier, dict]:
@@ -35,13 +35,16 @@ def train_single_model(
     torch.manual_seed(seed)
     np.random.seed(seed)
 
+    # Convert numpy arrays to tensors up front — no need to do it per batch
     X_tr = _to_tensor(data.X_train, torch.float32)
     y_tr = _to_tensor(data.y_train, torch.long)
-    X_va = _to_tensor(data.X_val, torch.float32)
-    y_va = _to_tensor(data.y_val, torch.long)
+    X_va = _to_tensor(data.X_val,   torch.float32)
+    y_va = _to_tensor(data.y_val,   torch.long)
 
-    model = GameClassifier(data.n_features, data.n_classes, hidden_dims, dropout)
+    model     = GameClassifier(data.n_features, data.n_classes, hidden_dims, dropout)
     criterion = nn.CrossEntropyLoss()
+    # weight_decay adds L2 regularization — helps prevent overfitting on the
+    # 384-dim embedding inputs where there are many parameters relative to samples
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", patience=10, factor=0.5,
@@ -53,27 +56,30 @@ def train_single_model(
 
     for epoch in range(1, epochs + 1):
         model.train()
+        # Shuffle training order every epoch by permuting indices
         perm = torch.randperm(len(X_tr))
         epoch_loss = 0.0
         for start in range(0, len(X_tr), batch_size):
-            idx = perm[start : start + batch_size]
+            idx    = perm[start : start + batch_size]
             logits = model(X_tr[idx])
-            loss = criterion(logits, y_tr[idx])
+            loss   = criterion(logits, y_tr[idx])
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
 
+        # Validation pass — no gradient needed here
         model.eval()
         with torch.no_grad():
             val_logits = model(X_va)
-            val_loss = criterion(val_logits, y_va).item()
-            val_acc = (val_logits.argmax(1) == y_va).float().mean().item()
+            val_loss   = criterion(val_logits, y_va).item()
+            val_acc    = (val_logits.argmax(1) == y_va).float().mean().item()
         scheduler.step(val_loss)
 
+        # Track best checkpoint — we'll restore this after early stopping
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            best_state = copy.deepcopy(model.state_dict())
+            best_state   = copy.deepcopy(model.state_dict())
             wait = 0
         else:
             wait += 1
@@ -88,6 +94,7 @@ def train_single_model(
                 print(f"  early stop at epoch {epoch}")
             break
 
+    # Go back to the best weights, not the final epoch
     model.load_state_dict(best_state)  # type: ignore[arg-type]
     return model, {"best_val_acc": best_val_acc}
 
@@ -98,15 +105,20 @@ def evaluate(
     *,
     tag: str = "test",
 ) -> dict:
-    """Evaluate a single model on the test (or val) split."""
+    """Evaluate a single model on the test (or val) split.
+
+    Returns accuracy, per-class accuracy dict, and the raw probability matrix
+    (needed for saving to npz and for the ensemble combiner).
+    """
     X = _to_tensor(data.X_test if tag == "test" else data.X_val, torch.float32)
     y = _to_tensor(data.y_test if tag == "test" else data.y_val, torch.long)
 
     model.eval()
     probs = model.predict_proba(X)
     preds = probs.argmax(1)
-    acc = (preds == y).float().mean().item()
+    acc   = (preds == y).float().mean().item()
 
+    # Per-class accuracy — shows if one game is dragging down the overall number
     per_class: dict[str, float] = {}
     for i, name in enumerate(data.label_names):
         mask = y == i
@@ -124,10 +136,11 @@ def ensemble_evaluate(
     X = _to_tensor(data.X_test, torch.float32)
     y = _to_tensor(data.y_test, torch.long)
 
+    # Stack per-model prob matrices, then average across the model dimension
     all_probs = torch.stack([m.predict_proba(X) for m in models])
     avg_probs = all_probs.mean(dim=0)
-    preds = avg_probs.argmax(1)
-    acc = (preds == y).float().mean().item()
+    preds     = avg_probs.argmax(1)
+    acc       = (preds == y).float().mean().item()
 
     per_class: dict[str, float] = {}
     for i, name in enumerate(data.label_names):
@@ -161,6 +174,8 @@ def run_on_gameplay_data(
     print("  Game-NN (gameplay)  ·  Numerical Feature Classifier")
     print("=" * 60)
 
+    # Check if the CNN already wrote a shared test split — if so, use it so all
+    # three models evaluate on the exact same records
     shared_split_path = Path("models/shared_split.npz")
     test_record_ids = None
     if shared_split_path.exists():
@@ -186,13 +201,14 @@ def run_on_gameplay_data(
     for name, acc in result["per_class"].items():
         print(f"    {name:30s} {acc:.4f}")
 
+    # ── Save model, test outputs, and scaler ──────────────────────────────
     save_dir = Path("models")
     save_dir.mkdir(exist_ok=True)
 
     torch.save(
         {"state_dict": model.state_dict(), "n_features": data.n_features,
          "n_classes": data.n_classes, "label_names": data.label_names,
-         "hidden_dims": hidden_dims},
+         "hidden_dims": hidden_dims},  # hidden_dims saved so dashboard can reconstruct the model
         save_dir / "nn.pt",
     )
     np.savez(
@@ -201,6 +217,8 @@ def run_on_gameplay_data(
         y_true=data.y_test,
         label_names=np.array(data.label_names),
     )
+    # Scaler is needed at inference time — the dashboard must apply the same
+    # normalization to live inputs that was applied during training
     with open(save_dir / "nn_scaler.pkl", "wb") as f:
         pickle.dump(nn_scaler, f)
     print(f"\n  Saved → models/nn.pt  |  models/nn_test.npz  |  models/nn_scaler.pkl")
@@ -217,13 +235,14 @@ def run(
     lr: float = 1e-2,
     batch_size: int = 32,
 ) -> None:
-    """Full pipeline: build dataset → train ensemble → evaluate."""
+    """Full pipeline on Steam tabular features: build dataset → train ensemble → evaluate."""
     print("=" * 60)
     print("  Game-NN  ·  FC Neural Network Training Pipeline")
     print("=" * 60)
 
     data = build_dataset(db_path)
 
+    # Train multiple models with different random seeds and average them
     models: list[GameClassifier] = []
     for i in range(n_ensemble):
         print(f"\n── Ensemble member {i + 1}/{n_ensemble} ──")

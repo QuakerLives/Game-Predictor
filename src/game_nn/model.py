@@ -13,6 +13,9 @@ class GameClassifier(nn.Module):
     produces raw logits; ``torch.nn.CrossEntropyLoss`` applies log-softmax
     internally, while :meth:`predict_proba` exposes explicit softmax
     probabilities for inference / ensembling.
+
+    This same class is reused by game_transformer — once trained on embeddings
+    it acts as the classifier head on top of the sentence transformer encoder.
     """
 
     def __init__(
@@ -26,6 +29,8 @@ class GameClassifier(nn.Module):
         layers: list[nn.Module] = []
         prev = input_dim
         for h in hidden_dims:
+            # BatchNorm before activation — stabilizes training on inputs with
+            # very different scales (the 384-dim embeddings can vary a lot per dimension)
             layers += [
                 nn.Linear(prev, h),
                 nn.BatchNorm1d(h),

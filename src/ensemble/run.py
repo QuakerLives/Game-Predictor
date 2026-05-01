@@ -70,6 +70,8 @@ def run() -> None:
         )
         sys.exit(1)
 
+    # Label order matters — index 0 in CNN probs must mean the same game as index 0
+    # in Transformer probs for the weighted average to be meaningful
     if cnn_labels != trans_labels:
         print("[ensemble] ERROR: label orderings differ between CNN and Transformer.")
         sys.exit(1)
@@ -132,7 +134,8 @@ def run() -> None:
 
     print()
 
-    # Best combined result (proportional weights — balanced and interpretable)
+    # Proportional weights are the final output — they're accuracy-weighted so
+    # stronger models contribute more, but no model gets zeroed out
     combiner = EnsembleCombiner(strategy="proportional")
     combiner.fit(probs_list, y_true)
     result = combiner.evaluate(probs_list, y_true, label_names)

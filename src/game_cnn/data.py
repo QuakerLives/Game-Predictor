@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 # ── Constants ────────────────────────────────────────────────────────────────
 
 TARGET_SIZE = (224, 224)
-BLUR_THRESHOLD = 100.0
-PHASH_TOLERANCE = 5
+BLUR_THRESHOLD = 100.0   # Laplacian variance below this = too blurry to use
+PHASH_TOLERANCE = 5      # pHash Hamming distance < 5 is effectively the same screenshot
 
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -66,6 +66,8 @@ class LoaderBundle:
 
 
 def _blur_score(img: Image.Image) -> float:
+    # Laplacian measures edge sharpness — blurry images have near-zero variance
+    # because all the high-frequency detail is smoothed out
     gray = np.array(img.convert("L"), dtype=np.float64)
     return float(laplace(gray).var())
 
@@ -134,6 +136,8 @@ def preprocess_manifest(
             blurry_list.append({"path": abs_path, "game": game_name, "score": score})
             continue
 
+        # pHash is robust to minor resizing/compression — two screenshots from the
+        # same video a few seconds apart will have a very small Hamming distance
         img_hash = imagehash.phash(img)
         matched = next(
             (p for h, p in seen_hashes if img_hash - h < phash_tolerance), None
@@ -194,6 +198,8 @@ def split_manifest(
 
 def _make_transforms(train: bool) -> transforms.Compose:
     if train:
+        # Augmentation on train only — random crop/flip/jitter expand the effective
+        # dataset size and prevent the model from memorizing exact pixel positions
         return transforms.Compose([
             transforms.Resize((256, 256)),
             transforms.RandomCrop(TARGET_SIZE),
@@ -203,6 +209,7 @@ def _make_transforms(train: bool) -> transforms.Compose:
             transforms.ToTensor(),
             transforms.Normalize(_IMAGENET_MEAN, _IMAGENET_STD),
         ])
+    # Val and test use deterministic resize + ImageNet normalization only
     return transforms.Compose([
         transforms.Resize(TARGET_SIZE),
         transforms.ToTensor(),

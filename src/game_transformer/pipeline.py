@@ -30,6 +30,8 @@ def run(
     print("  Game-Transformer  ·  Text Embedding Classifier")
     print("=" * 60)
 
+    # Load the shared test split from game_cnn if it exists — this ensures all three
+    # models are evaluated on the exact same records for valid ensemble combination
     shared_split_path = Path("models/shared_split.npz")
     test_record_ids = None
     if shared_split_path.exists():
@@ -40,8 +42,11 @@ def run(
         print("[transformer] no shared split found — using independent split")
         print("             (run game_cnn first to align test sets for ensemble)")
 
+    # build_dataset handles DB extraction, sanitization, embedding, splitting, and scaling
     data, scaler = build_dataset(db_path, test_record_ids=test_record_ids)
 
+    # Reuse the same FC classifier and training loop from game_nn — the only
+    # difference is that the input is now a 384-dim sentence embedding
     model, info = train_single_model(
         data,
         hidden_dims=hidden_dims,
@@ -62,7 +67,7 @@ def run(
     torch.save(
         {"state_dict": model.state_dict(), "n_features": data.n_features,
          "n_classes": data.n_classes, "label_names": data.label_names,
-         "hidden_dims": hidden_dims},
+         "hidden_dims": hidden_dims},  # hidden_dims saved so dashboard can reconstruct the model
         save_dir / "transformer.pt",
     )
     np.savez(
@@ -71,6 +76,8 @@ def run(
         y_true=data.y_test,
         label_names=np.array(data.label_names),
     )
+    # Scaler must be saved alongside the model — inference inputs need the same
+    # normalization that was applied to the training embeddings
     with open(save_dir / "transformer_scaler.pkl", "wb") as f:
         pickle.dump(scaler, f)
     print(f"\n  Saved → models/transformer.pt  |  models/transformer_test.npz  |  models/transformer_scaler.pkl")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import pickle
 from pathlib import Path
 
 import numpy as np
@@ -170,7 +171,7 @@ def run_on_gameplay_data(
         print("[nn-gameplay] no shared split found — using independent split")
         print("              (run game_cnn first to align test sets for ensemble)")
 
-    data = build_dataset_from_gameplay(gameplay_db_path, test_record_ids=test_record_ids)
+    data, nn_scaler = build_dataset_from_gameplay(gameplay_db_path, test_record_ids=test_record_ids)
 
     model, info = train_single_model(
         data,
@@ -190,7 +191,8 @@ def run_on_gameplay_data(
 
     torch.save(
         {"state_dict": model.state_dict(), "n_features": data.n_features,
-         "n_classes": data.n_classes, "label_names": data.label_names},
+         "n_classes": data.n_classes, "label_names": data.label_names,
+         "hidden_dims": hidden_dims},
         save_dir / "nn.pt",
     )
     np.savez(
@@ -199,7 +201,9 @@ def run_on_gameplay_data(
         y_true=data.y_test,
         label_names=np.array(data.label_names),
     )
-    print(f"\n  Saved → models/nn.pt  |  models/nn_test.npz")
+    with open(save_dir / "nn_scaler.pkl", "wb") as f:
+        pickle.dump(nn_scaler, f)
+    print(f"\n  Saved → models/nn.pt  |  models/nn_test.npz  |  models/nn_scaler.pkl")
 
     print("\n" + "=" * 60)
     print("  Pipeline complete. Run 'python -m ensemble.run' to combine all models.")

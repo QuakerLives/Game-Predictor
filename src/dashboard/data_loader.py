@@ -267,3 +267,157 @@ def predict_from_b64(image_b64: str) -> dict[str, float]:
     with torch.no_grad():
         probs = model.predict_proba(tensor).squeeze(0).numpy()
     return {name: float(p) for name, p in zip(labels, probs)}
+
+
+# ── Transformer live inference ─────────────────────────────────────────────────
+
+_trans_model: "object | None" = None
+_trans_labels: "list[str] | None" = None
+_trans_scaler: "object | None" = None
+_trans_encoder: "object | None" = None
+
+_SCRUB_PATTERNS_SIMPLE = [
+    "apex legends", "apex", "no man's sky", "no mans sky",
+    "skyrim", "the elder scrolls", "stardew valley", "stardew",
+    "stellaris",
+]
+
+
+def _scrub_narration(text: str) -> str:
+    import re
+    for phrase in _SCRUB_PATTERNS_SIMPLE:
+        text = re.sub(re.escape(phrase), "the game", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+def get_transformer_model() -> tuple:
+    """Lazy-load transformer weights, scaler, and encoder. Returns (model, labels, scaler, encoder) or Nones."""
+    global _trans_model, _trans_labels, _trans_scaler, _trans_encoder
+    if _trans_model is not None:
+        return _trans_model, _trans_labels, _trans_scaler, _trans_encoder
+
+    model_path  = MODELS_DIR / "transformer.pt"
+    scaler_path = MODELS_DIR / "transformer_scaler.pkl"
+    if not model_path.exists() or not scaler_path.exists():
+        return None, None, None, None
+
+    import pickle
+    import torch
+    import transformers as _hf; _hf.logging.set_verbosity_error()
+    from sentence_transformers import SentenceTransformer
+    from game_nn.model import GameClassifier
+
+    ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
+    hidden_dims = tuple(ckpt.get("hidden_dims", (256, 128, 64)))
+    model = GameClassifier(ckpt["n_features"], ckpt["n_classes"], hidden_dims)
+    model.load_state_dict(ckpt["state_dict"])
+    model.eval()
+
+    with open(scaler_path, "rb") as f:
+        scaler = pickle.load(f)
+
+    encoder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
+    _trans_model, _trans_labels = model, list(ckpt["label_names"])
+    _trans_scaler, _trans_encoder = scaler, encoder
+    return _trans_model, _trans_labels, _trans_scaler, _trans_encoder
+
+
+def predict_from_narration(text: str) -> dict[str, float]:
+    """Run Transformer inference on a raw narration string."""
+    import numpy as np
+    import torch
+
+    model, labels, scaler, encoder = get_transformer_model()
+    if model is None:
+        return {}
+
+    clean = _scrub_narration(text)
+    emb   = encoder.encode([clean]).astype(np.float64)      # (1, 384)
+    emb_s = scaler.transform(emb).astype(np.float32)
+    tensor = torch.tensor(emb_s)
+    with torch.no_grad():
+        probs = model.predict_proba(tensor).squeeze(0).numpy()
+    return {name: float(p) for name, p in zip(labels, probs)}
+
+
+# ── NN (gameplay features) live inference ─────────────────────────────────────
+
+_nn_model: "object | None" = None
+_nn_labels: "list[str] | None" = None
+_nn_scaler: "object | None" = None
+_nn_encoder: "object | None" = None
+
+_EXP_LEVEL_MAP = {"Poor": 0.0, "Fair": 1.0, "Good": 2.0, "Excellent": 3.0, "Superior": 4.0}
+
+
+def get_nn_model() -> tuple:
+    """Lazy-load NN gameplay weights, scaler, and encoder. Returns (model, labels, scaler, encoder) or Nones."""
+    global _nn_model, _nn_labels, _nn_scaler, _nn_encoder
+    if _nn_model is not None:
+        return _nn_model, _nn_labels, _nn_scaler, _nn_encoder
+
+    model_path  = MODELS_DIR / "nn.pt"
+    scaler_path = MODELS_DIR / "nn_scaler.pkl"
+    if not model_path.exists() or not scaler_path.exists():
+        return None, None, None, None
+
+    import pickle
+    import torch
+    import transformers as _hf; _hf.logging.set_verbosity_error()
+    from sentence_transformers import SentenceTransformer
+    from game_nn.model import GameClassifier
+
+    ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
+    hidden_dims = tuple(ckpt.get("hidden_dims", (256, 128, 64)))
+    model = GameClassifier(ckpt["n_features"], ckpt["n_classes"], hidden_dims)
+    model.load_state_dict(ckpt["state_dict"])
+    model.eval()
+
+    with open(scaler_path, "rb") as f:
+        scaler = pickle.load(f)
+
+    # Reuse transformer encoder if already loaded, otherwise load fresh
+    encoder = _trans_encoder or SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
+    _nn_model, _nn_labels = model, list(ckpt["label_names"])
+    _nn_scaler, _nn_encoder = scaler, encoder
+    return _nn_model, _nn_labels, _nn_scaler, _nn_encoder
+
+
+def predict_from_gameplay_features(
+    narration: str,
+    experience_level: str,
+    source_type: str,
+    has_player_name: bool,
+    has_timestamp: bool,
+    has_channel_desc: bool,
+) -> dict[str, float]:
+    """Run NN inference on structured gameplay fields + narration text."""
+    import numpy as np
+    import torch
+
+    model, labels, scaler, encoder = get_nn_model()
+    if model is None:
+        return {}
+
+    narration_len = float(len(narration))   # pre-sanitization, matching training
+    clean = _scrub_narration(narration)
+    emb   = encoder.encode([clean]).astype(np.float64)      # (1, 384)
+
+    exp_enc = _EXP_LEVEL_MAP.get(experience_level, 2.0)     # default "Good"
+    is_yt   = 1.0 if source_type == "youtube" else 0.0
+    meta    = np.array([[
+        exp_enc, is_yt,
+        1.0 if has_player_name  else 0.0,
+        1.0 if has_timestamp    else 0.0,
+        1.0 if has_channel_desc else 0.0,
+        narration_len,
+    ]], dtype=np.float64)
+
+    X = np.hstack([meta, emb])                              # (1, 390)
+    X_s = scaler.transform(X).astype(np.float32)
+    tensor = torch.tensor(X_s)
+    with torch.no_grad():
+        probs = model.predict_proba(tensor).squeeze(0).numpy()
+    return {name: float(p) for name, p in zip(labels, probs)}

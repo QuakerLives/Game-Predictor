@@ -337,7 +337,7 @@ def build_dataset_from_gameplay(
     test_ratio: float = 0.15,
     seed: int = 42,
     embed_batch_size: int = 64,
-) -> SplitData:
+) -> "tuple[SplitData, object]":
     """Build a feature matrix from gameplay_records for the ensemble NN.
 
     Features: 384-dim narration embedding + 6 per-record metadata + 7 Steam API features.
@@ -468,7 +468,7 @@ def build_dataset_from_gameplay(
     )
 
     # Standardize the full feature matrix (train-fit only)
-    X_tr, X_va, X_te, _ = standardize(X_tr, X_va, X_te)
+    X_tr, X_va, X_te, nn_scaler = standardize(X_tr, X_va, X_te)
 
     # Oversample minority classes in training set only
     pre = len(y_tr)
@@ -481,4 +481,4 @@ def build_dataset_from_gameplay(
         X_test=X_te, y_test=y_te,
         label_names=label_names,
         feature_names=feature_names,
-    )
+    ), nn_scaler

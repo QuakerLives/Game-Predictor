@@ -38,6 +38,33 @@ def _ensure_plotting() -> None:
 
 PLOT_CONFIG = {"displayModeBar": False}
 
+
+def _empty_pred_fig(msg: str = "") -> "go.Figure":
+    """Styled placeholder that matches the post-prediction bar chart exactly.
+
+    Shows all five game labels and the confidence axis at 0% so the layout
+    never jumps — only the bar lengths change after inference.
+    """
+    _ensure_plotting()
+    games  = list(GAME_COLORS.keys())
+    colors = [GAME_COLORS[g] for g in games]
+    fig = go.Figure(go.Bar(
+        x=[0] * len(games), y=games,
+        orientation="h",
+        marker_color=colors,
+        text=[""] * len(games),
+        textposition="outside",
+    ))
+    fig.update_layout(**PLOT_LAYOUT)
+    fig.update_layout(
+        title=msg or "",
+        xaxis=dict(title="Confidence (%)", range=[0, 118], gridcolor="#373b3e"),
+        height=280,
+        margin=dict(l=110, r=30, t=60, b=40),
+    )
+    return fig
+
+
 PLOT_LAYOUT: dict = dict(
     paper_bgcolor="#2c3034",
     plot_bgcolor="#2c3034",
@@ -315,15 +342,22 @@ def build_performance_tab() -> dbc.Container:
 
 
 def build_live_demo_tab() -> dbc.Container:
+    _input_style = {
+        "backgroundColor": "#343a40", "color": "#dee2e6",
+        "border": "1px solid #6c757d", "borderRadius": "6px",
+    }
+    _textarea_style = {**_input_style, "width": "100%", "resize": "vertical",
+                       "padding": "8px", "fontFamily": "inherit", "fontSize": "0.85rem"}
+
     return dbc.Container([
+        # ── CNN ───────────────────────────────────────────────────────────────
+        dbc.Row([
+            dbc.Col(html.H5("CNN  ·  EfficientNet-B0 (screenshot)", className="mt-3 mb-0"), width=12),
+            dbc.Col(html.P("Upload a gameplay screenshot and the CNN will classify it.",
+                           className="text-muted small mb-2"), width=12),
+        ]),
         dbc.Row([
             dbc.Col([
-                html.H5("Upload a gameplay screenshot", className="mt-3 mb-1"),
-                html.P(
-                    "The EfficientNet-B0 CNN will predict which of the five games "
-                    "the screenshot is from and show its confidence for each class.",
-                    className="text-muted small",
-                ),
                 dcc.Upload(
                     id="upload-image",
                     children=html.Div([
@@ -332,21 +366,139 @@ def build_live_demo_tab() -> dbc.Container:
                         html.Span("PNG, JPG, WEBP accepted", className="small text-muted"),
                     ]),
                     style={
-                        "width": "100%", "height": "130px",
-                        "lineHeight": "60px", "borderWidth": "2px",
-                        "borderStyle": "dashed", "borderRadius": "8px",
+                        "width": "100%", "height": "120px", "lineHeight": "55px",
+                        "borderWidth": "2px", "borderStyle": "dashed", "borderRadius": "8px",
                         "borderColor": "#6c757d", "textAlign": "center",
                         "cursor": "pointer", "paddingTop": "10px",
                     },
-                    multiple=False,
-                    accept="image/*",
+                    multiple=False, accept="image/*",
                 ),
                 html.Div(id="upload-status", className="mt-2 text-muted small"),
             ], width=4),
             dbc.Col(html.Div(id="preview-img-container"), width=3),
             dbc.Col(dcc.Graph(id="prediction-bar", config=PLOT_CONFIG,
-                              style={"height": "300px"}), width=5),
-        ], className="mt-3"),
+                              figure=_empty_pred_fig("Upload a screenshot to see the prediction"),
+                              style={"height": "280px"}), width=5),
+        ], className="mb-4"),
+
+        html.Hr(style={"borderColor": "#495057"}),
+
+        # ── Transformer ───────────────────────────────────────────────────────
+        dbc.Row([
+            dbc.Col(html.H5("Transformer  ·  all-MiniLM-L6-v2 (narration text)",
+                            className="mt-3 mb-0"), width=12),
+            dbc.Col(html.P("Type or paste a gameplay narration and the Transformer will classify it.",
+                           className="text-muted small mb-2"), width=12),
+        ]),
+        dbc.Row([
+            dbc.Col([
+                dcc.Textarea(
+                    id="narration-input",
+                    placeholder="Describe the gameplay scene in your own words…",
+                    style={**_textarea_style, "height": "120px"},
+                ),
+                dbc.Button("Predict", id="transformer-predict-btn",
+                           color="warning", size="sm", className="mt-2"),
+                html.Div(id="transformer-status", className="mt-2 text-muted small"),
+            ], width=5),
+            dbc.Col(dcc.Graph(id="transformer-prediction-bar", config=PLOT_CONFIG,
+                              figure=_empty_pred_fig("Enter a narration and click Predict"),
+                              style={"height": "280px"}), width=7),
+        ], className="mb-4"),
+
+        html.Hr(style={"borderColor": "#495057"}),
+
+        # ── NN ─────────────────────────────────────────────────────────────────
+        dbc.Row([
+            dbc.Col(html.H5("NN  ·  Gameplay features + narration embedding",
+                            className="mt-3 mb-0"), width=12),
+            dbc.Col(html.P("Fill in the gameplay metadata and narration; the NN combines "
+                           "structured fields with a text embedding.",
+                           className="text-muted small mb-2"), width=12),
+        ]),
+        dbc.Row([
+            dbc.Col([
+                dcc.Textarea(
+                    id="nn-narration-input",
+                    placeholder="Describe the gameplay scene…",
+                    style={**_textarea_style, "height": "100px"},
+                ),
+                dbc.Row([
+                    dbc.Col([
+                        html.Label("Experience level", className="small text-muted mt-2 mb-1"),
+                        dcc.Dropdown(
+                            id="nn-exp-level",
+                            options=[{"label": l, "value": l}
+                                     for l in ["Poor", "Fair", "Good", "Excellent", "Superior"]],
+                            value="Good",
+                            clearable=False,
+                            style={"color": "#000000"},
+                        ),
+                    ], width=6),
+                    dbc.Col([
+                        html.Label("Source type", className="small text-muted mt-2 mb-1"),
+                        dcc.Dropdown(
+                            id="nn-source-type",
+                            options=[{"label": "YouTube", "value": "youtube"},
+                                     {"label": "Google Images", "value": "google_images"}],
+                            value="youtube",
+                            clearable=False,
+                            style={"color": "#000000"},
+                        ),
+                    ], width=6),
+                ], className="g-2"),
+                dbc.Checklist(
+                    id="nn-flags",
+                    options=[
+                        {"label": "Has player name",       "value": "has_player_name"},
+                        {"label": "Has timestamp",         "value": "has_timestamp"},
+                        {"label": "Has channel description","value": "has_channel_desc"},
+                    ],
+                    value=["has_player_name", "has_timestamp"],
+                    inline=True,
+                    className="mt-2 small",
+                ),
+                dbc.Button("Predict", id="nn-predict-btn",
+                           color="success", size="sm", className="mt-2"),
+                html.Div(id="nn-status", className="mt-2 text-muted small"),
+            ], width=5),
+            dbc.Col(dcc.Graph(id="nn-prediction-bar", config=PLOT_CONFIG,
+                              figure=_empty_pred_fig("Fill in the form and click Predict"),
+                              style={"height": "280px"}), width=7),
+        ], className="mb-4"),
+
+        html.Hr(style={"borderColor": "#495057"}),
+
+        # ── Ensemble ──────────────────────────────────────────────────────────
+        dbc.Row([
+            dbc.Col(html.H5("Ensemble  ·  Combined prediction",
+                            className="mt-3 mb-0"), width=12),
+            dbc.Col(html.P(
+                "Select which models to combine. Each model uses the input "
+                "already filled in above — fill in whichever sections you want "
+                "to include before clicking Run.",
+                className="text-muted small mb-2"), width=12),
+        ]),
+        dbc.Row([
+            dbc.Col([
+                dbc.Checklist(
+                    id="ensemble-models",
+                    options=[
+                        {"label": "CNN  (requires screenshot above)",        "value": "cnn"},
+                        {"label": "Transformer  (requires narration above)",  "value": "transformer"},
+                        {"label": "NN  (requires narration + form above)",    "value": "nn"},
+                    ],
+                    value=["cnn", "transformer", "nn"],
+                    className="mb-3",
+                ),
+                dbc.Button("Run Ensemble", id="ensemble-run-btn",
+                           color="primary", size="sm"),
+                html.Div(id="ensemble-status", className="mt-2 text-muted small"),
+            ], width=4),
+            dbc.Col(dcc.Graph(id="ensemble-prediction-bar", config=PLOT_CONFIG,
+                              figure=_empty_pred_fig("Select models and click Run Ensemble"),
+                              style={"height": "280px"}), width=8),
+        ], className="mb-4"),
     ], fluid=True)
 
 

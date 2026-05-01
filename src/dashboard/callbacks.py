@@ -1,16 +1,44 @@
 """
 Dash callbacks:
-  - _url location     → build and inject the full tab layout on first page load
-  - model-select radio → update confusion matrix and per-class accuracy charts
-  - image upload       → CNN inference, image preview, prediction bar chart
+  - _url location         → build and inject the full tab layout on first page load
+  - model-select radio    → update confusion matrix and per-class accuracy charts
+  - image upload          → CNN inference, image preview, prediction bar chart
+  - narration text        → Transformer inference, prediction bar chart
+  - gameplay form         → NN inference, prediction bar chart
 """
 from __future__ import annotations
 
 import plotly.graph_objects as go
 from dash import Input, Output, State, callback, html
 
-from .data_loader import load_model_results, predict_from_b64, GAME_COLORS
-from .layout import confusion_matrix_fig, perclass_fig, PLOT_LAYOUT, PLOT_CONFIG
+from .data_loader import (
+    load_model_results, predict_from_b64,
+    predict_from_narration, predict_from_gameplay_features,
+    GAME_COLORS,
+)
+from .layout import confusion_matrix_fig, perclass_fig, PLOT_LAYOUT, PLOT_CONFIG, _empty_pred_fig
+
+
+def _prob_bar(probs: dict, title: str) -> go.Figure:
+    """Shared helper: build a horizontal confidence bar chart from a {game: prob} dict."""
+    sorted_items = sorted(probs.items(), key=lambda kv: kv[1])
+    games  = [g for g, _ in sorted_items]
+    scores = [p * 100 for _, p in sorted_items]
+    colors = [GAME_COLORS.get(g, "#adb5bd") for g in games]
+    fig = go.Figure(go.Bar(
+        x=scores, y=games, orientation="h",
+        marker_color=colors,
+        text=[f"{s:.1f}%" for s in scores],
+        textposition="outside",
+    ))
+    fig.update_layout(**PLOT_LAYOUT)
+    fig.update_layout(
+        title=title,
+        xaxis=dict(title="Confidence (%)", range=[0, 118], gridcolor="#373b3e"),
+        height=280,
+        margin=dict(l=110, r=30, t=60, b=40),
+    )
+    return fig
 
 
 @callback(
@@ -47,13 +75,8 @@ def update_model_charts(model_key: str):
 )
 def update_prediction(contents, filename):
     """Run CNN inference on the uploaded image and render the prediction bar chart."""
-    empty_fig = (
-        go.Figure()
-        .update_layout(**PLOT_LAYOUT, title="Upload an image to see the prediction")
-    )
-
     if contents is None:
-        return html.Div(), empty_fig, ""
+        return html.Div(), _empty_pred_fig("Upload a screenshot to see the prediction"), ""
 
     # Image preview
     preview = html.Img(
@@ -64,32 +87,152 @@ def update_prediction(contents, filename):
     try:
         probs = predict_from_b64(contents)
     except Exception as exc:
-        err_fig = go.Figure().update_layout(**PLOT_LAYOUT, title=f"Inference error: {exc}")
-        return preview, err_fig, f"Error processing {filename}: {exc}"
+        return preview, _empty_pred_fig(f"Inference error: {exc}"), f"Error processing {filename}: {exc}"
     if not probs:
-        no_model = go.Figure().update_layout(**PLOT_LAYOUT, title="CNN model not found — run game-cnn-train first")
-        return preview, no_model, f"Uploaded: {filename}"
+        return preview, _empty_pred_fig("CNN model not found — run game-cnn-train first"), f"Uploaded: {filename}"
 
-    # Sort ascending so the highest bar appears at the top of a horizontal chart
-    sorted_items = sorted(probs.items(), key=lambda kv: kv[1])
-    games  = [g for g, _ in sorted_items]
-    scores = [p * 100 for _, p in sorted_items]
-    colors = [GAME_COLORS.get(g, "#adb5bd") for g in games]
-    top    = max(probs, key=probs.get)
-
-    fig = go.Figure(go.Bar(
-        x=scores, y=games,
-        orientation="h",
-        marker_color=colors,
-        text=[f"{s:.1f}%" for s in scores],
-        textposition="outside",
-    ))
-    fig.update_layout(**PLOT_LAYOUT)
-    fig.update_layout(
-        title=f"Predicted: <b>{top}</b>  ({probs[top]*100:.1f}% confidence)",
-        xaxis=dict(title="Confidence (%)", range=[0, 118], gridcolor="#373b3e"),
-        height=300,
-        margin=dict(l=110, r=30, t=60, b=40),
-    )
-
+    top = max(probs, key=probs.get)
+    fig = _prob_bar(probs, f"Predicted: <b>{top}</b>  ({probs[top]*100:.1f}% confidence)")
     return preview, fig, f"Uploaded: {filename}"
+
+
+@callback(
+    Output("transformer-prediction-bar", "figure"),
+    Output("transformer-status", "children"),
+    Input("transformer-predict-btn", "n_clicks"),
+    State("narration-input", "value"),
+    prevent_initial_call=True,
+)
+def update_transformer_prediction(_, narration):
+    """Run Transformer inference on the typed narration."""
+    empty = _empty_pred_fig("Enter a narration and click Predict")
+    if not narration or not narration.strip():
+        return empty, ""
+    try:
+        probs = predict_from_narration(narration)
+    except Exception as exc:
+        return _empty_pred_fig(f"Error: {exc}"), str(exc)
+    if not probs:
+        return _empty_pred_fig("Transformer model not found — run game-transformer-train first"), ""
+    top = max(probs, key=probs.get)
+    return _prob_bar(probs, f"Predicted: <b>{top}</b>  ({probs[top]*100:.1f}% confidence)"), ""
+
+
+@callback(
+    Output("nn-prediction-bar", "figure"),
+    Output("nn-status", "children"),
+    Input("nn-predict-btn", "n_clicks"),
+    State("nn-narration-input", "value"),
+    State("nn-exp-level", "value"),
+    State("nn-source-type", "value"),
+    State("nn-flags", "value"),
+    prevent_initial_call=True,
+)
+def update_nn_prediction(_, narration, exp_level, source_type, flags):
+    """Run NN gameplay inference on the filled form."""
+    empty = _empty_pred_fig("Fill in the fields and click Predict")
+    if not narration or not narration.strip():
+        return empty, ""
+    flags = flags or []
+    try:
+        probs = predict_from_gameplay_features(
+            narration=narration,
+            experience_level=exp_level or "Good",
+            source_type=source_type or "youtube",
+            has_player_name="has_player_name" in flags,
+            has_timestamp="has_timestamp" in flags,
+            has_channel_desc="has_channel_desc" in flags,
+        )
+    except Exception as exc:
+        return _empty_pred_fig(f"Error: {exc}"), str(exc)
+    if not probs:
+        return _empty_pred_fig("NN model not found — run 'game-nn --gameplay' and retrain to save scaler"), ""
+    top = max(probs, key=probs.get)
+    return _prob_bar(probs, f"Predicted: <b>{top}</b>  ({probs[top]*100:.1f}% confidence)"), ""
+
+
+@callback(
+    Output("ensemble-prediction-bar", "figure"),
+    Output("ensemble-status", "children"),
+    Input("ensemble-run-btn", "n_clicks"),
+    State("ensemble-models", "value"),
+    State("upload-image", "contents"),
+    State("narration-input", "value"),
+    State("nn-narration-input", "value"),
+    State("nn-exp-level", "value"),
+    State("nn-source-type", "value"),
+    State("nn-flags", "value"),
+    prevent_initial_call=True,
+)
+def update_ensemble_prediction(_, selected, img_contents, trans_narration,
+                                nn_narration, exp_level, source_type, flags):
+    """Combine predictions from whichever models are selected and have inputs."""
+    import numpy as np
+
+    empty = _empty_pred_fig("Select models and click Run Ensemble")
+    selected = selected or []
+    if not selected:
+        return empty, "Select at least one model."
+
+    all_probs: list[dict] = []
+    skipped: list[str] = []
+    flags = flags or []
+
+    if "cnn" in selected:
+        if img_contents:
+            try:
+                p = predict_from_b64(img_contents)
+                if p:
+                    all_probs.append(p)
+                else:
+                    skipped.append("CNN (model not found)")
+            except Exception as exc:
+                skipped.append(f"CNN (error: {exc})")
+        else:
+            skipped.append("CNN (no image uploaded)")
+
+    if "transformer" in selected:
+        if trans_narration and trans_narration.strip():
+            try:
+                p = predict_from_narration(trans_narration)
+                if p:
+                    all_probs.append(p)
+                else:
+                    skipped.append("Transformer (model not found)")
+            except Exception as exc:
+                skipped.append(f"Transformer (error: {exc})")
+        else:
+            skipped.append("Transformer (no narration entered)")
+
+    if "nn" in selected:
+        narr = nn_narration if (nn_narration and nn_narration.strip()) else trans_narration
+        if narr and narr.strip():
+            try:
+                p = predict_from_gameplay_features(
+                    narration=narr,
+                    experience_level=exp_level or "Good",
+                    source_type=source_type or "youtube",
+                    has_player_name="has_player_name" in flags,
+                    has_timestamp="has_timestamp" in flags,
+                    has_channel_desc="has_channel_desc" in flags,
+                )
+                if p:
+                    all_probs.append(p)
+                else:
+                    skipped.append("NN (model not found — retrain to save scaler)")
+            except Exception as exc:
+                skipped.append(f"NN (error: {exc})")
+        else:
+            skipped.append("NN (no narration entered)")
+
+    if not all_probs:
+        status = "No models could run.  " + "  |  ".join(skipped)
+        return _empty_pred_fig("No predictions available"), status
+
+    games = list(all_probs[0].keys())
+    avg = {g: float(np.mean([p.get(g, 0.0) for p in all_probs])) for g in games}
+    top = max(avg, key=avg.get)
+    n = len(all_probs)
+    title = f"Ensemble ({n} model{'s' if n > 1 else ''}): <b>{top}</b>  ({avg[top]*100:.1f}%)"
+    status = ("Skipped: " + "  |  ".join(skipped)) if skipped else f"{n} model(s) combined."
+    return _prob_bar(avg, title), status

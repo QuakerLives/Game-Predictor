@@ -61,7 +61,8 @@ def run(
 
     torch.save(
         {"state_dict": model.state_dict(), "n_features": data.n_features,
-         "n_classes": data.n_classes, "label_names": data.label_names},
+         "n_classes": data.n_classes, "label_names": data.label_names,
+         "hidden_dims": hidden_dims},
         save_dir / "transformer.pt",
     )
     np.savez(
